@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0d0d1a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>TwinForge 3D</title>
+<style>
+:root{
+  --bg:#0d0d1a;--sur:#161628;--bdr:#2a2a4a;
+  --acc:#00e5ff;--pink:#ff3399;--pur:#9b59ff;
+  --txt:#e8e8f8;--mut:#888aaa;
+  --st:env(safe-area-inset-top,0px);
+  --sb:env(safe-area-inset-bottom,0px);
+}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;background:var(--bg);color:var(--txt);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow:hidden}
+
+/* ── screens ── */
+.screen{position:absolute;inset:0;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;
+  padding:calc(var(--st)+16px) 24px calc(var(--sb)+16px);
+  transition:opacity .3s,transform .3s}
+.screen.hidden{opacity:0;pointer-events:none;transform:translateY(18px)}
+.screen.visible{opacity:1;pointer-events:all;transform:none}
+
+/* ── typography ── */
+.logo{font-size:12px;letter-spacing:3px;color:var(--acc);text-transform:uppercase;margin-bottom:6px}
+h1{font-size:30px;font-weight:800;letter-spacing:-1px;
+  background:linear-gradient(135deg,#fff 30%,var(--pur));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.tag{font-size:13px;color:var(--mut);margin-top:8px;text-align:center;line-height:1.5}
+
+/* ── buttons ── */
+.btn{width:100%;max-width:340px;padding:17px;border-radius:14px;border:none;
+  font-size:16px;font-weight:700;cursor:pointer;transition:transform .15s,opacity .15s}
+.btn:active{transform:scale(.97);opacity:.85}
+.btn-p{background:linear-gradient(135deg,var(--acc),var(--pur));color:#000;margin-top:28px}
+.btn-o{background:transparent;border:1.5px solid var(--bdr);color:var(--txt);margin-top:10px}
+.btn-g{background:linear-gradient(135deg,#00c853,#1de9b6);color:#000;margin-top:20px}
+.btn-pink{background:linear-gradient(135deg,var(--pink),var(--pur));color:#fff;margin-top:10px}
+
+/* ── camera screen ── */
+#sc-cam{padding:0;background:#000}
+#video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+#cam-ui{position:absolute;inset:0;pointer-events:none;display:flex;flex-direction:column}
+
+/* guide ring */
+.gring{position:absolute;top:50%;left:50%;
+  transform:translate(-50%,-56%);
+  width:min(68vw,270px);height:min(68vw,270px);
+  border-radius:50%;border:2.5px solid rgba(0,229,255,.6);
+  box-shadow:0 0 0 4px rgba(0,229,255,.1),inset 0 0 0 4px rgba(0,229,255,.05);
+  transition:border-color .4s}
+.gring.good{border-color:rgba(0,200,100,.8)}
+
+/* coverage arc overlay */
+#cov-svg{position:absolute;top:50%;left:50%;
+  transform:translate(-50%,-56%);
+  width:min(68vw,270px);height:min(68vw,270px)}
+
+/* corners */
+.bk{position:absolute;width:22px;height:22px;border-color:var(--acc);border-style:solid}
+.tl{top:10px;left:10px;border-width:3px 0 0 3px;border-radius:6px 0 0 0}
+.tr{top:10px;right:10px;border-width:3px 3px 0 0;border-radius:0 6px 0 0}
+.bl{bottom:10px;left:10px;border-width:0 0 3px 3px;border-radius:0 0 0 6px}
+.br{bottom:10px;right:10px;border-width:0 3px 3px 0;border-radius:0 0 6px 0}
+
+/* top bar */
+.ctop{display:flex;justify-content:space-between;align-items:center;
+  padding:calc(var(--st)+10px) 18px 10px;
+  background:linear-gradient(to bottom,rgba(0,0,0,.75),transparent)}
+.ctitle{font-size:14px;font-weight:700;color:#fff;letter-spacing:.5px}
+.fcnt{font-size:13px;color:var(--acc);font-weight:600;
+  background:rgba(0,0,0,.5);padding:4px 12px;border-radius:20px;
+  border:1px solid rgba(0,229,255,.3)}
+
+/* guidance pill */
+#guide-pill{position:absolute;top:50%;left:50%;
+  transform:translate(-50%,calc(-50% + min(36vw,145px) + 16px));
+  background:rgba(0,0,0,.8);backdrop-filter:blur(8px);
+  border:1px solid rgba(255,255,255,.15);border-radius:24px;
+  padding:10px 20px;font-size:14px;color:#fff;font-weight:600;
+  text-align:center;max-width:80vw;line-height:1.4;
+  transition:background .4s}
+#guide-pill.urgent{background:rgba(255,51,153,.4);border-color:var(--pink)}
+#guide-pill.good{background:rgba(0,200,100,.35);border-color:#00c853}
+
+/* confidence bar */
+#conf-wrap{position:absolute;bottom:185px;left:50%;
+  transform:translateX(-50%);width:min(72vw,280px)}
+.cbar-bg{height:5px;background:rgba(255,255,255,.15);border-radius:3px;overflow:hidden}
+.cbar-fg{height:100%;border-radius:3px;width:0%;
+  background:linear-gradient(90deg,var(--pink),var(--acc));transition:width .5s}
+.cbar-lbl{display:flex;justify-content:space-between;margin-top:5px;
+  font-size:11px;color:rgba(255,255,255,.55)}
+
+/* angle dots */
+#adots{position:absolute;bottom:165px;left:50%;
+  transform:translateX(-50%);display:flex;gap:5px}
+.adot{width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,.25);
+  transition:background .3s,transform .2s}
+.adot.done{background:var(--acc)}
+.adot.cur{background:var(--pink);transform:scale(1.4)}
+
+/* bottom controls */
+.cbot{position:absolute;bottom:0;left:0;right:0;
+  padding:16px 32px calc(var(--sb)+16px);
+  background:linear-gradient(to top,rgba(0,0,0,.88),transparent);
+  display:flex;align-items:center;justify-content:center;gap:28px}
+.shutter{width:74px;height:74px;border-radius:50%;background:#fff;
+  border:4px solid rgba(255,255,255,.35);cursor:pointer;
+  box-shadow:0 0 0 6px rgba(255,255,255,.12);
+  transition:transform .12s,background .3s;flex-shrink:0;pointer-events:all}
+.shutter:active{transform:scale(.9)}
+.shutter.auto{background:linear-gradient(135deg,var(--acc),var(--pur))}
+#auto-lbl{font-size:11px;color:rgba(255,255,255,.6);text-align:center;
+  max-width:68px;line-height:1.4}
+.ctip{font-size:11px;color:rgba(255,255,255,.5);text-align:center;max-width:68px;line-height:1.4}
+
+/* flash */
+.flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;transition:opacity .07s}
+.flash.on{opacity:.6}
+
+/* ── processing ── */
+.spinner{width:46px;height:46px;border-radius:50%;border:3px solid var(--bdr);
+  border-top-color:var(--acc);animation:spin .8s linear infinite;margin-bottom:20px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.pbar{width:100%;max-width:300px;margin-top:24px}
+.pb-bg{height:6px;background:var(--bdr);border-radius:3px;overflow:hidden}
+.pb-fg{height:100%;border-radius:3px;width:0%;
+  background:linear-gradient(90deg,var(--acc),var(--pur));transition:width .4s}
+.pb-lbl{display:flex;justify-content:space-between;margin-top:6px;
+  font-size:12px;color:var(--mut)}
+
+.stages{margin-top:24px;display:flex;flex-direction:column;gap:10px;
+  width:100%;max-width:300px}
+.stg{display:flex;align-items:center;gap:12px;padding:12px 14px;
+  border-radius:12px;background:var(--sur);border:1px solid var(--bdr);font-size:13px}
+.stg.active{border-color:var(--acc);box-shadow:0 0 0 1px rgba(0,229,255,.15)}
+.stg.done{border-color:rgba(0,229,255,.3);opacity:.7}
+.stg-ico{width:30px;height:30px;border-radius:8px;background:var(--bg);
+  display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
+.stg-name{font-weight:600;font-size:13px}
+.stg-sub{font-size:11px;color:var(--mut);margin-top:1px}
+.stg-chk{margin-left:auto;font-size:15px}
+
+/* ── result ── */
+.prev{width:100%;max-width:340px;aspect-ratio:16/10;border-radius:14px;
+  overflow:hidden;border:1px solid var(--bdr);background:#0a0a18;
+  margin-top:18px;position:relative}
+.prev img{width:100%;height:100%;object-fit:contain}
+.prev-badge{position:absolute;bottom:7px;right:7px;
+  background:rgba(0,0,0,.7);border-radius:7px;padding:3px 10px;
+  font-size:11px;color:var(--acc);border:1px solid rgba(0,229,255,.3)}
+.stats{display:flex;gap:10px;margin-top:14px;width:100%;max-width:340px}
+.stat{flex:1;background:var(--sur);border:1px solid var(--bdr);
+  border-radius:12px;padding:12px;text-align:center}
+.stat-n{font-size:22px;font-weight:800;color:var(--acc)}
+.stat-l{font-size:11px;color:var(--mut);margin-top:1px}
+
+/* ── connect ── */
+.inp{width:100%;max-width:300px;margin-top:8px;padding:14px;
+  background:var(--sur);border:1.5px solid var(--bdr);border-radius:12px;
+  color:var(--txt);font-size:14px;font-family:monospace;outline:none}
+.inp:focus{border-color:var(--acc)}
+
+/* toast */
+#toast{position:fixed;bottom:calc(var(--sb)+22px);left:50%;
+  transform:translateX(-50%) translateY(72px);
+  background:var(--sur);border:1px solid var(--bdr);border-radius:22px;
+  padding:10px 22px;font-size:13px;color:var(--txt);
+  box-shadow:0 8px 28px rgba(0,0,0,.5);transition:transform .3s;
+  white-space:nowrap;z-index:999}
+#toast.show{transform:translateX(-50%) translateY(0)}
+</style>
+</head>
+<body>
+
+<!-- ── Welcome ── -->
+<div id="sc-welcome" class="screen visible">
+  <div class="logo">TwinForge 3D</div>
+  <h1>Scan. Model. Simulate.</h1>
+  <p class="tag">Walk around your robot with your phone.<br>
+    The AI guides you until it has enough data,<br>
+    then generates a URDF you can use in ROS&nbsp;/&nbsp;Gazebo.</p>
+  <button class="btn btn-p" onclick="startScan()">📷 Start Scanning</button>
+  <button class="btn btn-o" onclick="show('sc-connect')">📡 Change server IP</button>
+</div>
+
+<!-- ── Connect ── -->
+<div id="sc-connect" class="screen hidden">
+  <div class="logo">Connection</div>
+  <h1 style="font-size:24px">Connect to PC</h1>
+  <p class="tag">Phone and PC must be on the same Wi-Fi.<br>
+     Enter your PC's IP address (shown in terminal).</p>
+  <label style="font-size:11px;color:var(--mut);letter-spacing:1px;margin-top:20px">
+    SERVER ADDRESS</label>
+  <input id="srv-inp" class="inp" type="text" placeholder="http://192.168.1.XX:8000">
+  <button class="btn btn-p" onclick="testConn()">Test Connection</button>
+  <button class="btn btn-o" onclick="show('sc-welcome')">← Back</button>
+</div>
+
+<!-- ── Camera ── -->
+<div id="sc-cam" class="screen hidden">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="cvs" style="display:none"></canvas>
+
+  <div id="cam-ui">
+    <div class="bk tl"></div><div class="bk tr"></div>
+    <div class="bk bl"></div><div class="bk br"></div>
+
+    <div class="ctop">
+      <div class="ctitle">TwinForge 3D</div>
+      <div class="fcnt" id="fcnt">0 frames</div>
+    </div>
+
+    <!-- Guide ring with SVG coverage arcs -->
+    <div class="gring" id="gring"></div>
+    <svg id="cov-svg" viewBox="0 0 270 270" fill="none">
+      <circle id="cov-arc" cx="135" cy="135" r="131"
+        stroke="rgba(0,229,255,.0)" stroke-width="5"
+        stroke-dasharray="0 1000"
+        stroke-linecap="round"
+        transform="rotate(-90 135 135)"
+        style="transition:stroke-dasharray .5s,stroke .4s"/>
+    </svg>
+
+    <div id="guide-pill">Point camera at the robot</div>
+
+    <div id="conf-wrap">
+      <div class="cbar-bg"><div class="cbar-fg" id="conf-bar"></div></div>
+      <div class="cbar-lbl">
+        <span id="conf-lbl">Coverage 0%</span>
+        <span id="conf-tip">Walk around the robot</span>
+      </div>
+    </div>
+
+    <div id="adots"></div>
+
+    <div class="flash" id="flash"></div>
+
+    <div class="cbot" style="pointer-events:all">
+      <div class="ctip" id="tip-l">Tap shutter<br>each step</div>
+      <button class="shutter" id="shutter" onclick="captureFrame()"></button>
+      <div style="display:flex;flex-direction:column;align-items:center;gap:6px">
+        <button class="btn btn-o"
+          style="width:auto;padding:8px 16px;font-size:12px;margin:0"
+          id="auto-btn" onclick="toggleAuto()">Auto OFF</button>
+        <div class="auto-lbl" id="auto-lbl" style="font-size:11px;color:rgba(255,255,255,.5)"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Processing ── -->
+<div id="sc-proc" class="screen hidden">
+  <div class="spinner"></div>
+  <div class="logo">Processing</div>
+  <h1 style="font-size:20px" id="proc-h">Building your robot…</h1>
+  <div class="pbar">
+    <div class="pb-bg"><div class="pb-fg" id="pb"></div></div>
+    <div class="pb-lbl"><span id="pb-stage">Starting</span><span id="pb-pct">0%</span></div>
+  </div>
+  <div class="stages">
+    <div class="stg" id="stg-recon">
+      <div class="stg-ico">🔬</div>
+      <div><div class="stg-name">3D Reconstruction</div>
+           <div class="stg-sub" id="sub-recon">Building point cloud from your photos</div></div>
+      <div class="stg-chk" id="chk-recon">⌛</div>
+    </div>
+    <div class="stg" id="stg-seg">
+      <div class="stg-ico">🧩</div>
+      <div><div class="stg-name">AI Segmentation</div>
+           <div class="stg-sub">Identifying robot components</div></div>
+      <div class="stg-chk" id="chk-seg">⌛</div>
+    </div>
+    <div class="stg" id="stg-joints">
+      <div class="stg-ico">🔩</div>
+      <div><div class="stg-name">Joint Detection</div>
+           <div class="stg-sub">Bayesian + geometric analysis</div></div>
+      <div class="stg-chk" id="chk-joints">⌛</div>
+    </div>
+    <div class="stg" id="stg-urdf">
+      <div class="stg-ico">📄</div>
+      <div><div class="stg-name">URDF Generation</div>
+           <div class="stg-sub">Building simulation model</div></div>
+      <div class="stg-chk" id="chk-urdf">⌛</div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Result ── -->
+<div id="sc-result" class="screen hidden">
+  <div class="logo">Complete 🎉</div>
+  <h1 style="font-size:22px">Your Robot is Ready</h1>
+  <div class="prev">
+    <img id="prev-img" src="" alt="Robot preview">
+    <div class="prev-badge" id="prev-badge">–</div>
+  </div>
+  <div class="stats">
+    <div class="stat"><div class="stat-n" id="s-links">–</div><div class="stat-l">Links</div></div>
+    <div class="stat"><div class="stat-n" id="s-joints">–</div><div class="stat-l">Joints</div></div>
+    <div class="stat"><div class="stat-n" id="s-frames">–</div><div class="stat-l">Frames</div></div>
+  </div>
+  <button class="btn btn-p" onclick="view3d()">🤖 View in 3D</button>
+  <button class="btn btn-pink" onclick="dlURDF()">⬇️ Download URDF</button>
+  <button class="btn btn-o" onclick="scanAgain()">📷 Scan Another</button>
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let srv        = localStorage.getItem('tf_srv') || window.location.origin;
+let jobId      = null;
+let nFrames    = 0;
+let confidence = 0;
+let wsConn     = null;
+let autoMode   = false;
+let autoTimer  = null;
+let animTimer  = null;
+let meta       = null;
+const TARGET   = 12;
+
+// ── Navigation ──────────────────────────────────────────────────────────────
+function show(id) {
+  document.querySelectorAll('.screen').forEach(s => {
+    s.classList.toggle('visible', s.id===id);
+    s.classList.toggle('hidden',  s.id!==id);
+  });
+}
+
+function toast(msg, ms=2600) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), ms);
+}
+
+// ── Connect ──────────────────────────────────────────────────────────────────
+async function testConn() {
+  const v = document.getElementById('srv-inp').value.trim();
+  if (v) { srv = v; localStorage.setItem('tf_srv', srv); }
+  try {
+    const r = await fetch(`${srv}/jobs/create`, {method:'POST'});
+    if (r.ok) { toast('✅ Connected!'); setTimeout(()=>show('sc-welcome'),800); }
+    else        toast('❌ Server error');
+  } catch { toast('❌ Cannot reach server'); }
+}
+
+// ── Camera ───────────────────────────────────────────────────────────────────
+async function startScan() {
+  show('sc-cam');
+  nFrames = 0; confidence = 0;
+  buildDots();
+  updateConf(0, 'Walk slowly around the robot');
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:'environment',width:{ideal:1280},height:{ideal:720}}});
+    document.getElementById('video').srcObject = stream;
+  } catch {
+    toast('⚠️ Camera unavailable');
+    show('sc-welcome'); return;
+  }
+
+  // Create job
+  try {
+    const r = await fetch(`${srv}/jobs/create`, {method:'POST'});
+    jobId   = (await r.json()).job_id;
+    connectWS();
+  } catch {
+    jobId = 'offline';
+    toast('⚠️ Server offline — offline mode');
+  }
+}
+
+function buildDots() {
+  const w = document.getElementById('adots');
+  w.innerHTML = '';
+  for (let i=0;i<TARGET;i++) {
+    const d = document.createElement('div');
+    d.className = 'adot' + (i===0?' cur':'');
+    d.id = `d${i}`;
+    w.appendChild(d);
+  }
+}
+
+function updateDots(n) {
+  for(let i=0;i<TARGET;i++) {
+    const d=document.getElementById(`d${i}`);
+    if(!d) continue;
+    d.className='adot'+(i<n?' done':i===n?' cur':'');
+  }
+}
+
+function updateConf(pct, tip) {
+  document.getElementById('conf-bar').style.width = pct+'%';
+  document.getElementById('conf-lbl').textContent = `Coverage ${Math.round(pct)}%`;
+  document.getElementById('conf-tip').textContent = tip || '';
+  // Coverage arc: circumference of r=131 circle ≈ 823
+  const arc = document.getElementById('cov-arc');
+  const circ = 2 * Math.PI * 131;
+  const dash = (pct/100) * circ;
+  arc.setAttribute('stroke-dasharray', `${dash} ${circ}`);
+  arc.setAttribute('stroke', pct >= 75 ? 'rgba(0,200,100,.7)' : 'rgba(0,229,255,.6)');
+  // Ring colour
+  document.getElementById('gring').classList.toggle('good', pct>=75);
+}
+
+function updateGuidance(msg, urgent=false, good=false) {
+  const el = document.getElementById('guide-pill');
+  el.textContent = msg;
+  el.classList.toggle('urgent', urgent);
+  el.classList.toggle('good',   good);
+}
+
+// ── Capture ───────────────────────────────────────────────────────────────────
+async function captureFrame() {
+  const video = document.getElementById('video');
+  const cvs   = document.getElementById('cvs');
+  cvs.width   = video.videoWidth  || 640;
+  cvs.height  = video.videoHeight || 480;
+  cvs.getContext('2d').drawImage(video, 0, 0);
+
+  // Flash
+  const fl = document.getElementById('flash');
+  fl.classList.add('on');
+  setTimeout(()=>fl.classList.remove('on'), 100);
+
+  nFrames++;
+  document.getElementById('fcnt').textContent = `${nFrames} frames`;
+  updateDots(nFrames);
+
+  // Upload + get guidance
+  cvs.toBlob(async blob => {
+    if (jobId && jobId !== 'offline') {
+      try {
+        const fd = new FormData();
+        fd.append('file', blob, 'frame.jpg');
+        const r  = await fetch(`${srv}/jobs/${jobId}/frame`, {method:'POST',body:fd});
+        const g  = await r.json();
+        applyGuidance(g);
+      } catch(e) {
+        // offline — keep going
+      }
+    }
+  }, 'image/jpeg', 0.82);
+}
+
+function applyGuidance(g) {
+  const conf = Math.round((g.confidence||0)*100);
+  updateConf(conf, g.needs_angles && g.needs_angles[0]
+               ? `Next: ${g.needs_angles[0]}` : 'Good coverage!');
+  updateGuidance(g.guidance || 'Keep scanning…',
+                 conf < 40, conf >= 75);
+
+  // Auto-advance when server says ready
+  if (g.ready && nFrames >= 6) {
+    if (autoMode) clearInterval(autoTimer);
+    setTimeout(startProcessing, 800);
+  }
+}
+
+// ── Auto-capture ──────────────────────────────────────────────────────────────
+function toggleAuto() {
+  autoMode = !autoMode;
+  const btn = document.getElementById('auto-btn');
+  const lbl = document.getElementById('auto-lbl');
+  btn.textContent = autoMode ? 'Auto ON' : 'Auto OFF';
+  btn.style.borderColor = autoMode ? 'var(--acc)' : '';
+  document.getElementById('shutter').classList.toggle('auto', autoMode);
+  if (autoMode) {
+    lbl.textContent = 'capturing every 2s';
+    autoTimer = setInterval(captureFrame, 2000);
+  } else {
+    lbl.textContent = '';
+    clearInterval(autoTimer);
+  }
+}
+
+// ── Processing ────────────────────────────────────────────────────────────────
+async function startProcessing() {
+  if (autoMode) { clearInterval(autoTimer); autoMode=false; }
+  const video = document.getElementById('video');
+  if (video.srcObject) video.srcObject.getTracks().forEach(t=>t.stop());
+
+  show('sc-proc');
+
+  if (!jobId || jobId==='offline') { runOfflineDemo(); return; }
+
+  try {
+    await fetch(`${srv}/jobs/${jobId}/run`, {
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({robot_name:'scanned_robot'})
+    });
+  } catch { runOfflineDemo(); return; }
+
+  // WS already open — just watch progress
+}
+
+function connectWS() {
+  if (!jobId || jobId==='offline') return;
+  const url = srv.replace(/^http/,'ws')+`/jobs/${jobId}/ws`;
+  wsConn = new WebSocket(url);
+  wsConn.onmessage = e => {
+    const d = JSON.parse(e.data);
+    if (d.type==='progress')  onProgress(d);
+    if (d.type==='complete')  onComplete(d);
+    if (d.type==='error')     onError(d.msg);
+    if (d.type==='frame_update') applyGuidance(d);
+  };
+}
+
+function onProgress(d) {
+  document.getElementById('pb').style.width     = (d.pct||0)+'%';
+  document.getElementById('pb-pct').textContent  = (d.pct||0)+'%';
+  document.getElementById('pb-stage').textContent = d.msg||'';
+  document.getElementById('proc-h').textContent  = d.msg||'Processing…';
+
+  const stageMap = {
+    loading:['recon'],segmenting:['recon','seg'],
+    joints:['recon','seg','joints'],urdf:['recon','seg','joints','urdf'],
+    rendering:['recon','seg','joints','urdf'],done:['recon','seg','joints','urdf']
+  };
+  const done = stageMap[d.stage]||[];
+  ['recon','seg','joints','urdf'].forEach(s=>{
+    const el=document.getElementById(`stg-${s}`);
+    const ck=document.getElementById(`chk-${s}`);
+    if(!el) return;
+    if(done.includes(s)){el.className='stg done';ck.textContent='✅';}
+    else if(done.length && s===['recon','seg','joints','urdf'][done.length])
+      {el.className='stg active';ck.textContent='⚡';}
+  });
+}
+
+function onComplete(d) {
+  meta = d;
+  showResult(d);
+}
+
+function onError(msg) {
+  toast('❌ '+msg, 4000);
+  show('sc-welcome');
+}
+
+// ── Offline demo progress ─────────────────────────────────────────────────────
+function runOfflineDemo() {
+  const steps=[
+    [10,'loading','Reconstructing 3D from your photos…'],
+    [25,'loading',`${nFrames*80|0} points reconstructed`],
+    [38,'segmenting','AI segmenting robot components…'],
+    [52,'segmenting','Found 5 components'],
+    [62,'joints','Detecting joints — Bayesian analysis…'],
+    [75,'joints','Found 4 revolute joints'],
+    [83,'urdf','Generating URDF with STL meshes…'],
+    [93,'rendering','Rendering animation frames…'],
+    [100,'done','Complete!'],
+  ];
+  let i=0;
+  const tick=()=>{
+    if(i>=steps.length){
+      showResult({n_links:5,n_joints:4,animation_frames:36,
+                  frame_url_template:null,urdf_url:null,job_id:'demo'});
+      return;
+    }
+    const [p,s,m]=steps[i++];
+    onProgress({pct:p,stage:s,msg:m});
+    setTimeout(tick,700+Math.random()*300);
+  };
+  tick();
+}
+
+// ── Result ────────────────────────────────────────────────────────────────────
+function showResult(d) {
+  if(wsConn) wsConn.close();
+  show('sc-result');
+  document.getElementById('s-links').textContent  = d.n_links||'–';
+  document.getElementById('s-joints').textContent = d.n_joints||'–';
+  document.getElementById('s-frames').textContent = d.animation_frames||'–';
+
+  if(d.frame_url_template && d.animation_frames>0) {
+    let fi=0, total=d.animation_frames;
+    const tick=()=>{
+      const url=d.frame_url_template.replace('{:04d}',String(fi).padStart(4,'0'));
+      document.getElementById('prev-img').src = `${srv}${url}`;
+      document.getElementById('prev-badge').textContent = `Frame ${fi+1}/${total}`;
+      fi=(fi+1)%total;
+    };
+    tick();
+    animTimer=setInterval(tick,120);
+  }
+}
+
+function view3d()  {
+  if(!jobId||jobId==='offline'||jobId==='demo')
+    { toast('Open on PC: '+srv+'/viewer/demo'); return; }
+  window.open(`${srv}/viewer/${jobId}`,'_blank');
+}
+function dlURDF()  {
+  if(!jobId||jobId==='offline'||jobId==='demo')
+    { toast('URDF available on PC'); return; }
+  window.open(`${srv}/jobs/${jobId}/urdf`,'_blank');
+}
+function scanAgain() {
+  if(animTimer) clearInterval(animTimer);
+  jobId=null; nFrames=0; confidence=0; meta=null;
+  show('sc-welcome');
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  if(window.location.port==='8000') srv=window.location.origin;
+  const s=localStorage.getItem('tf_srv');
+  if(s) document.getElementById('srv-inp').value=s;
+  // Seed with current origin in input
+  if(!s) document.getElementById('srv-inp').value=window.location.origin;
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,31 @@
+# ── Core pipeline (required) ─────────────────────────────────────────────────
+open3d>=0.18.0
+numpy>=1.24
+scipy>=1.11
+scikit-learn>=1.3
+opencv-python>=4.8
+matplotlib>=3.7
+
+# ── Server / mobile app (required) ───────────────────────────────────────────
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+aiofiles>=23.0
+websockets>=12.0
+qrcode>=7.4
+pillow>=10.0
+requests>=2.31
+
+# ── Optional: real scanning ───────────────────────────────────────────────────
+# pyrealsense2>=2.54       # Intel RealSense RGB-D
+
+# ── Optional: AI models (all have CPU/heuristic fallbacks) ───────────────────
+# openai>=1.0              # GPT-4o VLM  (set OPENAI_API_KEY)
+# sam2>=1.0                # SAM 2 segmentation
+# Install GroundingDINO from: https://github.com/IDEA-Research/GroundingDINO
+
+# ── Optional: simulation export ──────────────────────────────────────────────
+# urdf2webots>=2.0         # Webots .proto export
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+pytest>=7.4

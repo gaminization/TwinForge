@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d0d1a">
+<title>TwinForge 3D — Viewer</title>
+<style>
+  :root {
+    --bg:#0d0d1a; --surface:#161628; --border:#2a2a4a;
+    --accent:#00e5ff; --pink:#ff3399; --purple:#9b59ff;
+    --text:#e8e8f8; --muted:#888aaa;
+    --safe-top:env(safe-area-inset-top,0px);
+    --safe-bot:env(safe-area-inset-bottom,0px);
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html,body { height:100%; background:var(--bg); color:var(--text);
+              font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+              overflow:hidden; }
+  #canvas-wrap { position:absolute; inset:0; }
+  canvas { display:block; width:100%!important; height:100%!important; }
+
+  /* Header */
+  #header { position:absolute; top:calc(var(--safe-top)+0px); left:0; right:0;
+            padding:14px 20px; display:flex; align-items:center; gap:12px;
+            background:linear-gradient(to bottom,rgba(13,13,26,.95),transparent);
+            pointer-events:none; }
+  #header-title { flex:1; }
+  .hdr-label { font-size:11px; color:var(--accent); letter-spacing:2px; text-transform:uppercase; }
+  .hdr-name  { font-size:18px; font-weight:800; color:var(--text); }
+  .hdr-sub   { font-size:12px; color:var(--muted); margin-top:2px; }
+  .hdr-btn   { pointer-events:all; background:var(--surface); border:1px solid var(--border);
+               border-radius:10px; padding:8px 16px; color:var(--text); font-size:13px;
+               cursor:pointer; transition:border-color .2s; text-decoration:none;
+               display:flex; align-items:center; gap:6px; }
+  .hdr-btn:hover { border-color:var(--accent); }
+
+  /* Side panel */
+  #panel { position:absolute; right:0; top:0; bottom:0; width:280px;
+           background:rgba(13,13,26,.92); backdrop-filter:blur(12px);
+           border-left:1px solid var(--border); display:flex; flex-direction:column;
+           padding:calc(var(--safe-top)+70px) 0 calc(var(--safe-bot)+12px);
+           transition:transform .3s; z-index:10; }
+  #panel.collapsed { transform:translateX(100%); }
+  #panel-toggle { position:absolute; left:-40px; top:50%; transform:translateY(-50%);
+                  width:36px; height:56px; background:var(--surface);
+                  border:1px solid var(--border); border-right:none;
+                  border-radius:10px 0 0 10px; cursor:pointer;
+                  display:flex; align-items:center; justify-content:center;
+                  font-size:18px; color:var(--accent); }
+
+  .panel-section { padding:16px 20px; border-bottom:1px solid var(--border); }
+  .panel-section:last-child { border-bottom:none; }
+  .panel-title { font-size:11px; color:var(--accent); letter-spacing:2px;
+                 text-transform:uppercase; margin-bottom:12px; }
+
+  /* Animation controls */
+  .anim-controls { display:flex; gap:8px; align-items:center; }
+  .ctrl-btn { background:var(--surface); border:1px solid var(--border);
+              border-radius:8px; padding:8px 14px; color:var(--text);
+              font-size:14px; cursor:pointer; flex:1; text-align:center;
+              transition:border-color .2s, background .2s; }
+  .ctrl-btn:hover { border-color:var(--accent); }
+  .ctrl-btn.active { background:var(--accent); color:#000; border-color:var(--accent); }
+  .speed-row { display:flex; align-items:center; gap:10px; margin-top:10px;
+               font-size:12px; color:var(--muted); }
+  input[type=range] { flex:1; accent-color:var(--accent); }
+
+  /* Joint list */
+  .joint-list { display:flex; flex-direction:column; gap:10px;
+                overflow-y:auto; flex:1; padding:16px 20px; }
+  .joint-card { background:var(--surface); border:1px solid var(--border);
+                border-radius:12px; padding:12px 14px; }
+  .joint-row1 { display:flex; justify-content:space-between; align-items:center;
+                margin-bottom:8px; }
+  .joint-name { font-size:13px; font-weight:600; color:var(--text); }
+  .joint-type { font-size:11px; color:var(--pink); background:rgba(255,51,153,.1);
+                border-radius:6px; padding:2px 8px; }
+  .joint-val  { font-size:12px; color:var(--accent); font-family:monospace; }
+  .joint-axis { font-size:11px; color:var(--muted); margin-bottom:6px; }
+  input.jslider { width:100%; accent-color:var(--accent); cursor:pointer; }
+
+  /* Link list */
+  .link-list { display:flex; flex-direction:column; gap:6px; padding:0 20px 16px; overflow-y:auto; }
+  .link-item { display:flex; align-items:center; gap:10px;
+               padding:8px 12px; border-radius:10px; background:var(--surface);
+               border:1px solid var(--border); font-size:13px; }
+  .link-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
+  .link-lbl  { flex:1; color:var(--text); }
+  .link-type { font-size:11px; color:var(--muted); }
+
+  /* Status overlay */
+  #status-overlay { position:absolute; inset:0; display:flex; flex-direction:column;
+                    align-items:center; justify-content:center; background:var(--bg); }
+  #status-overlay.hidden { display:none; }
+  .status-spinner { width:52px; height:52px; border-radius:50%;
+                    border:3px solid var(--border); border-top-color:var(--accent);
+                    animation:spin .8s linear infinite; margin-bottom:20px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .status-msg { font-size:15px; color:var(--muted); }
+  .status-sub { font-size:13px; color:var(--muted); margin-top:6px; }
+
+  /* Mobile: collapse panel by default */
+  @media (max-width:640px) {
+    #panel { width:260px; }
+    #panel.collapsed { transform:translateX(100%); }
+  }
+</style>
+</head>
+<body>
+
+<div id="canvas-wrap">
+  <canvas id="three-canvas"></canvas>
+</div>
+
+<!-- Header -->
+<div id="header">
+  <div id="header-title">
+    <div class="hdr-label">TwinForge 3D</div>
+    <div class="hdr-name" id="hdr-robot-name">Loading…</div>
+    <div class="hdr-sub" id="hdr-stats">–</div>
+  </div>
+  <a id="btn-download" class="hdr-btn" href="#" download>⬇️ URDF</a>
+</div>
+
+<!-- Side Panel -->
+<div id="panel">
+  <div id="panel-toggle" onclick="togglePanel()">⚙️</div>
+
+  <div class="panel-section">
+    <div class="panel-title">Animation</div>
+    <div class="anim-controls">
+      <div class="ctrl-btn active" id="btn-play"  onclick="setAnim('play')">▶ Play</div>
+      <div class="ctrl-btn"       id="btn-pause" onclick="setAnim('pause')">⏸ Pause</div>
+      <div class="ctrl-btn"       id="btn-reset" onclick="resetPose()">⏮ Reset</div>
+    </div>
+    <div class="speed-row">
+      <span>Speed</span>
+      <input type="range" id="speed-slider" min="0.1" max="3" step="0.1" value="1"
+             oninput="animSpeed=parseFloat(this.value)">
+      <span id="speed-val">1×</span>
+    </div>
+  </div>
+
+  <div class="panel-section" style="padding-bottom:8px">
+    <div class="panel-title">Joints (<span id="n-joints">0</span>)</div>
+  </div>
+  <div class="joint-list" id="joint-list"></div>
+
+  <div class="panel-section" style="padding-bottom:8px">
+    <div class="panel-title">Links (<span id="n-links">0</span>)</div>
+  </div>
+  <div class="link-list" id="link-list"></div>
+</div>
+
+<!-- Loading overlay -->
+<div id="status-overlay">
+  <div class="status-spinner"></div>
+  <div class="status-msg" id="status-msg">Loading robot…</div>
+  <div class="status-sub" id="status-sub">Setting up 3D viewer</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ── Config ────────────────────────────────────────────────────────────────────
+const jobId     = window.location.pathname.split('/').pop();
+const serverUrl = window.location.origin;
+let meta        = null;
+let animPlaying = true;
+let animSpeed   = 1.0;
+let animTime    = 0;
+let ANIM_PERIOD = 4.0;
+
+// Joint override: when user drags slider, pause auto-anim for that joint
+const jointOverrides = {};   // joint_id → {value, locked}
+
+// ── FK math ───────────────────────────────────────────────────────────────────
+function rotMat(axis, angle) {
+  const [x,y,z] = axis;
+  const c=Math.cos(angle), s=Math.sin(angle), t=1-c;
+  const m = new THREE.Matrix4();
+  m.set(
+    t*x*x+c,   t*x*y-s*z, t*x*z+s*y, 0,
+    t*x*y+s*z, t*y*y+c,   t*y*z-s*x, 0,
+    t*x*z-s*y, t*y*z+s*x, t*z*z+c,   0,
+    0,0,0,1
+  );
+  return m;
+}
+
+function rpyMat(rpy) {
+  const [r,p,y] = rpy;
+  const Rx = rotMat([1,0,0], r);
+  const Ry = rotMat([0,1,0], p);
+  const Rz = rotMat([0,0,1], y);
+  return new THREE.Matrix4().multiplyMatrices(Rz, new THREE.Matrix4().multiplyMatrices(Ry, Rx));
+}
+
+function jointTransform(jtype, axis, q) {
+  const T = new THREE.Matrix4();
+  const a = new THREE.Vector3(...axis).normalize();
+  if (jtype === 'revolute' || jtype === 'continuous') {
+    T.copy(rotMat([a.x,a.y,a.z], q));
+  } else if (jtype === 'prismatic') {
+    T.makeTranslation(a.x*q, a.y*q, a.z*q);
+  }
+  return T;
+}
+
+function forwardKinematics(joints, jointValues) {
+  // Returns Map: link_id → THREE.Matrix4 (world transform)
+  const transforms = new Map();
+  const childSet   = new Set(joints.map(j => j.child));
+  const allLinks   = new Set([...joints.map(j=>j.parent), ...joints.map(j=>j.child)]);
+  const roots      = [...allLinks].filter(l => !childSet.has(l));
+  const root       = roots[0];
+
+  function fk(linkId, Tparent) {
+    transforms.set(linkId, Tparent.clone());
+    joints.filter(j => j.parent === linkId).forEach(j => {
+      // T_offset
+      const Toff = new THREE.Matrix4();
+      Toff.copy(rpyMat(j.origin_rpy));
+      Toff.setPosition(...j.origin_xyz);
+      // T_motion
+      const q = jointValues[j.id] ?? 0;
+      const Tmot = jointTransform(j.type, j.axis, q);
+      // Chain
+      const Tchild = Tparent.clone().multiply(Toff).multiply(Tmot);
+      fk(j.child, Tchild);
+    });
+  }
+  fk(root, new THREE.Matrix4());
+  return transforms;
+}
+
+// ── Three.js Setup ───────────────────────────────────────────────────────────
+const canvas   = document.getElementById('three-canvas');
+const renderer = new THREE.WebGLRenderer({canvas, antialias:true, alpha:true});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type    = THREE.PCFSoftShadowMap;
+renderer.setClearColor(0x0d0d1a, 1);
+
+const scene  = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, 1, 0.001, 100);
+camera.position.set(0.5, 0.4, 0.8);
+camera.lookAt(0, 0.2, 0);
+
+// Lighting
+scene.add(new THREE.AmbientLight(0x334466, 1.2));
+const sun = new THREE.DirectionalLight(0xffffff, 2.5);
+sun.position.set(2, 4, 3);
+sun.castShadow = true;
+scene.add(sun);
+const fill = new THREE.DirectionalLight(0x4488ff, 0.6);
+fill.position.set(-2, 1, -2);
+scene.add(fill);
+
+// Grid
+const grid = new THREE.GridHelper(2, 20, 0x1a1a3a, 0x1a1a3a);
+scene.add(grid);
+
+// Orbit controls (manual implementation — no import needed)
+let isMouseDown=false, lastMouse={x:0,y:0};
+let orbitTheta=0.6, orbitPhi=1.1, orbitR=1.2, orbitTarget=new THREE.Vector3(0,0.2,0);
+
+function updateCamera() {
+  const x = orbitTarget.x + orbitR*Math.sin(orbitPhi)*Math.sin(orbitTheta);
+  const y = orbitTarget.y + orbitR*Math.cos(orbitPhi);
+  const z = orbitTarget.z + orbitR*Math.sin(orbitPhi)*Math.cos(orbitTheta);
+  camera.position.set(x,y,z);
+  camera.lookAt(orbitTarget);
+}
+updateCamera();
+
+// Pointer events for orbit
+canvas.addEventListener('pointerdown', e => { isMouseDown=true; lastMouse={x:e.clientX,y:e.clientY}; });
+canvas.addEventListener('pointerup',   () => isMouseDown=false);
+canvas.addEventListener('pointermove', e => {
+  if (!isMouseDown) return;
+  const dx=(e.clientX-lastMouse.x)*0.005, dy=(e.clientY-lastMouse.y)*0.005;
+  orbitTheta -= dx;
+  orbitPhi    = Math.max(0.1, Math.min(Math.PI-0.1, orbitPhi+dy));
+  lastMouse   = {x:e.clientX, y:e.clientY};
+  updateCamera();
+});
+canvas.addEventListener('wheel', e => {
+  orbitR = Math.max(0.2, Math.min(5, orbitR + e.deltaY*0.002));
+  updateCamera();
+}, {passive:true});
+
+// Touch orbit
+let lastTouch=null, lastPinch=null;
+canvas.addEventListener('touchstart', e => {
+  if (e.touches.length===1) lastTouch={x:e.touches[0].clientX, y:e.touches[0].clientY};
+  if (e.touches.length===2) {
+    const dx=e.touches[0].clientX-e.touches[1].clientX;
+    const dy=e.touches[0].clientY-e.touches[1].clientY;
+    lastPinch=Math.sqrt(dx*dx+dy*dy);
+  }
+}, {passive:true});
+canvas.addEventListener('touchmove', e => {
+  if (e.touches.length===1 && lastTouch) {
+    const dx=(e.touches[0].clientX-lastTouch.x)*0.007;
+    const dy=(e.touches[0].clientY-lastTouch.y)*0.007;
+    orbitTheta-=dx; orbitPhi=Math.max(0.1,Math.min(Math.PI-0.1,orbitPhi+dy));
+    lastTouch={x:e.touches[0].clientX,y:e.touches[0].clientY};
+    updateCamera();
+  }
+  if (e.touches.length===2 && lastPinch) {
+    const dx=e.touches[0].clientX-e.touches[1].clientX;
+    const dy=e.touches[0].clientY-e.touches[1].clientY;
+    const pinch=Math.sqrt(dx*dx+dy*dy);
+    orbitR=Math.max(0.2,Math.min(5,orbitR*(lastPinch/pinch)));
+    lastPinch=pinch; updateCamera();
+  }
+}, {passive:true});
+
+// Resize
+function resize() {
+  const w=window.innerWidth, h=window.innerHeight;
+  renderer.setSize(w,h);
+  camera.aspect=w/h;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize); resize();
+
+// ── Mesh loading ──────────────────────────────────────────────────────────────
+const LINK_COLORS = {
+  base:         0x595959,
+  arm_link:     0x3389cc,
+  end_effector: 0xe5801a,
+  wheel:        0x1a1a1a,
+  other:        0xaaaaaa,
+};
+
+const linkMeshes     = {};   // link_id → THREE.Mesh
+const linkBasePos    = {};   // link_id → Vector3 (centroid in local frame)
+
+async function loadSTL(url) {
+  // Minimal binary STL parser
+  const buf = await (await fetch(url)).arrayBuffer();
+  const dv  = new DataView(buf);
+  const n   = dv.getUint32(80, true);
+  const positions = [];
+  const normals   = [];
+  for (let i=0; i<n; i++) {
+    const base = 84 + i*50;
+    const nx=dv.getFloat32(base,true), ny=dv.getFloat32(base+4,true), nz=dv.getFloat32(base+8,true);
+    for (let v=0; v<3; v++) {
+      const o=base+12+v*12;
+      positions.push(dv.getFloat32(o,true),dv.getFloat32(o+4,true),dv.getFloat32(o+8,true));
+      normals.push(nx,ny,nz);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions,3));
+  geo.setAttribute('normal',   new THREE.Float32BufferAttribute(normals,3));
+  return geo;
+}
+
+async function loadRobot(robotMeta) {
+  setStatus('Loading meshes…', `${robotMeta.n_links} links`);
+
+  for (const link of robotMeta.links) {
+    let geo;
+    try {
+      geo = await loadSTL(`${serverUrl}${link.mesh_url}`);
+    } catch(e) {
+      // Fallback: box
+      const [ex,ey,ez] = link.extent.map(v=>Math.max(v,0.01));
+      geo = new THREE.BoxGeometry(ex,ey,ez);
+    }
+
+    const mat  = new THREE.MeshStandardMaterial({
+      color:       LINK_COLORS[link.type] ?? 0xaaaaaa,
+      roughness:   0.55, metalness: 0.25,
+    });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.castShadow    = true;
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+    linkMeshes[link.id]  = mesh;
+    linkBasePos[link.id] = new THREE.Vector3(...link.centroid);
+  }
+
+  buildPanel(robotMeta);
+  hideStatus();
+}
+
+// ── Panel UI ──────────────────────────────────────────────────────────────────
+function buildPanel(m) {
+  document.getElementById('hdr-robot-name').textContent = m.robot_name || 'Robot';
+  document.getElementById('hdr-stats').textContent =
+    `${m.n_links} links · ${m.n_joints} joints`;
+  document.getElementById('n-joints').textContent = m.n_joints;
+  document.getElementById('n-links').textContent  = m.n_links;
+
+  const dlBtn = document.getElementById('btn-download');
+  dlBtn.href  = `${serverUrl}${m.urdf_url}`;
+  dlBtn.setAttribute('download', (m.robot_name||'robot')+'.urdf');
+
+  // Joints
+  const jList = document.getElementById('joint-list');
+  jList.innerHTML = '';
+  m.joints.forEach(j => {
+    if (j.type === 'fixed') return;
+    const lo=j.limit_lower, hi=j.limit_upper, mid=(lo+hi)/2;
+    const card = document.createElement('div');
+    card.className = 'joint-card';
+    card.innerHTML = `
+      <div class="joint-row1">
+        <span class="joint-name">${j.id.replace('joint_','').replace(/_/g,' ')}</span>
+        <span class="joint-type">${j.type}</span>
+      </div>
+      <div class="joint-axis">axis: [${j.axis.map(v=>v.toFixed(2)).join(', ')}]</div>
+      <div class="joint-row1">
+        <span class="joint-val" id="jval-${j.id}">0.00 rad</span>
+        <span style="font-size:11px;color:var(--muted)">${lo.toFixed(2)} → ${hi.toFixed(2)}</span>
+      </div>
+      <input class="jslider" type="range" id="jslider-${j.id}"
+             min="${lo}" max="${hi}" step="0.01" value="${mid}"
+             oninput="onJointSlider('${j.id}', parseFloat(this.value))">
+    `;
+    jList.appendChild(card);
+  });
+
+  // Links
+  const lList = document.getElementById('link-list');
+  lList.innerHTML = '';
+  m.links.forEach(link => {
+    const item = document.createElement('div');
+    item.className = 'link-item';
+    const col = '#' + (LINK_COLORS[link.type]??0xaaaaaa).toString(16).padStart(6,'0');
+    item.innerHTML = `
+      <div class="link-dot" style="background:${col}"></div>
+      <div class="link-lbl">${link.label}</div>
+      <div class="link-type">${link.type}</div>
+    `;
+    lList.appendChild(item);
+  });
+}
+
+function onJointSlider(jid, val) {
+  jointOverrides[jid] = val;
+  document.getElementById(`jval-${jid}`).textContent = val.toFixed(2)+' rad';
+}
+
+// ── Animation loop ────────────────────────────────────────────────────────────
+let lastTime = performance.now();
+
+function animate(now) {
+  requestAnimationFrame(animate);
+  const dt = Math.min((now - lastTime) / 1000, 0.05);
+  lastTime  = now;
+
+  if (!meta) { renderer.render(scene, camera); return; }
+
+  if (animPlaying) animTime += dt * animSpeed;
+
+  // Compute joint values
+  const jointValues = {};
+  meta.joints.forEach((j,i) => {
+    if (j.type === 'fixed') { jointValues[j.id]=0; return; }
+    if (jointOverrides[j.id] !== undefined) {
+      jointValues[j.id] = jointOverrides[j.id];
+      return;
+    }
+    const lo=j.limit_lower, hi=j.limit_upper;
+    const amp=(hi-lo)/2, mid=(lo+hi)/2;
+    const phase=i*(2*Math.PI/Math.max(meta.joints.filter(x=>x.type!=='fixed').length,1));
+    jointValues[j.id] = mid + amp*Math.sin(2*Math.PI*animTime/ANIM_PERIOD + phase);
+    // Update slider
+    const sl = document.getElementById(`jslider-${j.id}`);
+    const vl = document.getElementById(`jval-${j.id}`);
+    if (sl) sl.value = jointValues[j.id];
+    if (vl) vl.textContent = jointValues[j.id].toFixed(2)+' rad';
+  });
+
+  // FK
+  const world = forwardKinematics(meta.joints, jointValues);
+
+  // Apply to meshes
+  for (const [lid, mesh] of Object.entries(linkMeshes)) {
+    const T = world.get(lid);
+    if (!T) continue;
+    // Extract rotation + position from matrix
+    const pos = new THREE.Vector3(); const quat = new THREE.Quaternion(); const sc=new THREE.Vector3();
+    T.decompose(pos, quat, sc);
+    mesh.position.copy(pos);
+    mesh.quaternion.copy(quat);
+  }
+
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(animate);
+
+// ── Controls ──────────────────────────────────────────────────────────────────
+function setAnim(mode) {
+  animPlaying = (mode === 'play');
+  document.getElementById('btn-play').classList.toggle('active',  animPlaying);
+  document.getElementById('btn-pause').classList.toggle('active', !animPlaying);
+}
+
+function resetPose() {
+  animTime = 0;
+  Object.keys(jointOverrides).forEach(k => delete jointOverrides[k]);
+  setAnim('pause');
+}
+
+document.getElementById('speed-slider').addEventListener('input', function() {
+  animSpeed = parseFloat(this.value);
+  document.getElementById('speed-val').textContent = animSpeed.toFixed(1)+'×';
+});
+
+let panelOpen = true;
+function togglePanel() {
+  panelOpen = !panelOpen;
+  document.getElementById('panel').classList.toggle('collapsed', !panelOpen);
+  document.getElementById('panel-toggle').textContent = panelOpen ? '⚙️' : '⚙️';
+}
+
+// ── Status helpers ────────────────────────────────────────────────────────────
+function setStatus(msg, sub) {
+  document.getElementById('status-msg').textContent = msg;
+  document.getElementById('status-sub').textContent = sub || '';
+  document.getElementById('status-overlay').classList.remove('hidden');
+}
+function hideStatus() {
+  document.getElementById('status-overlay').classList.add('hidden');
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+async function boot() {
+  setStatus('Fetching robot data…', jobId);
+
+  if (jobId === 'demo') {
+    // Generate demo meta locally
+    meta = {
+      robot_name: 'Demo Arm',
+      n_links: 5, n_joints: 4,
+      urdf_url: '#',
+      links: [
+        {id:'link_0',label:'base',type:'base',centroid:[0,0.04,0],extent:[0.15,0.15,0.08],mesh_url:null},
+        {id:'link_1',label:'link_1',type:'arm_link',centroid:[0,0.2,0],extent:[0.04,0.04,0.2],mesh_url:null},
+        {id:'link_2',label:'link_2',type:'arm_link',centroid:[0,0.38,0],extent:[0.04,0.04,0.18],mesh_url:null},
+        {id:'link_3',label:'link_3',type:'arm_link',centroid:[0,0.54,0],extent:[0.03,0.03,0.14],mesh_url:null},
+        {id:'link_4',label:'end_effector',type:'end_effector',centroid:[0,0.64,0],extent:[0.05,0.05,0.05],mesh_url:null},
+      ],
+      joints: [
+        {id:'j1',parent:'link_0',child:'link_1',type:'revolute',axis:[0,0,1],origin_xyz:[0,0.08,0],origin_rpy:[0,0,0],limit_lower:-1.57,limit_upper:1.57},
+        {id:'j2',parent:'link_1',child:'link_2',type:'revolute',axis:[1,0,0],origin_xyz:[0,0.2,0],origin_rpy:[0,0,0],limit_lower:-1.2,limit_upper:1.2},
+        {id:'j3',parent:'link_2',child:'link_3',type:'revolute',axis:[1,0,0],origin_xyz:[0,0.18,0],origin_rpy:[0,0,0],limit_lower:-1.0,limit_upper:1.0},
+        {id:'j4',parent:'link_3',child:'link_4',type:'revolute',axis:[0,0,1],origin_xyz:[0,0.14,0],origin_rpy:[0,0,0],limit_lower:-1.57,limit_upper:1.57},
+      ],
+    };
+    buildPanel(meta);
+    // Build simple box meshes for demo
+    meta.links.forEach(link => {
+      const [ex,ey,ez]=link.extent.map(v=>Math.max(v,0.01));
+      const geo=new THREE.BoxGeometry(ex,ey,ez);
+      const mat=new THREE.MeshStandardMaterial({
+        color:LINK_COLORS[link.type]??0xaaaaaa, roughness:0.55, metalness:0.25});
+      const mesh=new THREE.Mesh(geo,mat);
+      mesh.castShadow=true; mesh.receiveShadow=true;
+      scene.add(mesh);
+      linkMeshes[link.id]=mesh;
+      linkBasePos[link.id]=new THREE.Vector3(...link.centroid);
+    });
+    hideStatus();
+    return;
+  }
+
+  // Load from server
+  let attempts = 0;
+  const tryLoad = async () => {
+    try {
+      const r = await fetch(`${serverUrl}/jobs/${jobId}/meta`);
+      if (!r.ok) {
+        if (attempts++ < 20) { setTimeout(tryLoad, 2000); return; }
+        setStatus('Robot not ready yet', 'Waiting for processing…');
+        return;
+      }
+      meta = await r.json();
+      await loadRobot(meta);
+    } catch(e) {
+      if (attempts++ < 10) setTimeout(tryLoad, 2000);
+      else setStatus('Could not load robot data', e.message);
+    }
+  };
+  tryLoad();
+}
+
+boot();
+</script>
+</body>
+</html>
