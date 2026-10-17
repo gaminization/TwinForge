@@ -1,0 +1,29 @@
+<!doctype html><html><body style="margin:0;background:#808890">
+<script src="three.min.js"></script>
+<script>
+function parseSTL(buf){const dv=new DataView(buf);const n=dv.getUint32(80,true);const pos=new Float32Array(n*9),nor=new Float32Array(n*9);let o=84;
+ for(let i=0;i<n;i++){const nx=dv.getFloat32(o,true),ny=dv.getFloat32(o+4,true),nz=dv.getFloat32(o+8,true);o+=12;
+  for(let v=0;v<3;v++){pos.set([dv.getFloat32(o,true),dv.getFloat32(o+4,true),dv.getFloat32(o+8,true)],i*9+v*3);nor.set([nx,ny,nz],i*9+v*3);o+=12}o+=2}
+ const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(pos,3));g.setAttribute('normal',new THREE.BufferAttribute(nor,3));return g}
+const W=768,H=1024;
+const renderer=new THREE.WebGLRenderer({antialias:true,preserveDrawingBuffer:true});renderer.setSize(W,H);document.body.appendChild(renderer.domElement);
+renderer.setClearColor(0x808890);
+const scene=new THREE.Scene();
+const camera=new THREE.PerspectiveCamera(40,W/H,0.01,10);camera.up.set(0,0,1);
+const COL={base:[.45,.45,.5],waist:[.2,.45,.85],arm1:[.15,.6,.9],arm2:[.2,.72,.75],gripper:[.9,.5,.2]};
+const vs=`varying vec3 vP;varying vec3 vN;void main(){vP=position;vN=normal;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}`;
+const fs=`precision highp float;varying vec3 vP;varying vec3 vN;uniform vec3 uC;
+float h(vec3 p){p=fract(p*0.3183099+.1);p*=17.;return fract(p.x*p.y*p.z*(p.x+p.y+p.z));}
+float vn(vec3 x){vec3 i=floor(x),f=fract(x);f=f*f*(3.-2.*f);
+ return mix(mix(mix(h(i),h(i+vec3(1,0,0)),f.x),mix(h(i+vec3(0,1,0)),h(i+vec3(1,1,0)),f.x),f.y),
+            mix(mix(h(i+vec3(0,0,1)),h(i+vec3(1,0,1)),f.x),mix(h(i+vec3(0,1,1)),h(i+vec3(1,1,1)),f.x),f.y),f.z);}
+void main(){float t=0.;float a=.5;vec3 q=vP*220.;for(int k=0;k<4;k++){t+=a*vn(q);q*=2.1;a*=.5;}
+ vec3 n=normalize(vN);float d=max(dot(n,normalize(vec3(.4,.3,.9))),0.)*.7+.3;
+ gl_FragColor=vec4(uC*(0.45+0.9*t)*d,1.);}`;
+window.ready=false;const POSE=new URLSearchParams(location.search).get('pose');
+(async()=>{const PJ=POSE?await (await fetch(`pose_${POSE}.json`)).json():null;for(const id of Object.keys(COL)){const b=await (await fetch(`world_${id}.stl`)).arrayBuffer();
+ const m=new THREE.Mesh(parseSTL(b),new THREE.ShaderMaterial({vertexShader:vs,fragmentShader:fs,uniforms:{uC:{value:new THREE.Vector3(...COL[id])}},side:THREE.DoubleSide}));if(PJ){m.matrixAutoUpdate=false;m.matrix.set(...PJ[id]);}scene.add(m);}
+ window.ready=true;})();
+window.view=(az,el,r,tx,ty,tz)=>{const a=az*Math.PI/180,e=el*Math.PI/180;
+ camera.position.set(tx+r*Math.cos(e)*Math.cos(a),ty+r*Math.cos(e)*Math.sin(a),tz+r*Math.sin(e));camera.lookAt(tx,ty,tz);renderer.render(scene,camera);};
+</script></body></html>

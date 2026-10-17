@@ -1,47 +1,88 @@
 #!/usr/bin/env python3
 """
-TwinForge 3D — Server Launcher
+TwinForge 3D — Start Server
+============================
+Generates a self-signed SSL cert so phone camera works (HTTPS required),
+then launches the FastAPI server with QR code printed to terminal.
 
 Usage:
-    python start_server.py             # default port 8000
-    python start_server.py --port 8080
-    python start_server.py --demo      # open browser with demo job
-
-Opens the server on all network interfaces so your phone can connect over WiFi.
-Prints the local IP address and a QR code to scan from your phone.
+    python3 start_server.py [--port 8443] [--http]
 """
-
-import argparse
-import logging
-import os
-import socket
-import sys
-import threading
-import time
-import webbrowser
+import argparse, os, socket, subprocess, sys, tempfile
 from pathlib import Path
 
-# ── Project root on path ─────────────────────────────────────────────────────
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
-logging.basicConfig(level=logging.INFO,
-                    format="[%(levelname)s] %(name)s: %(message)s")
-log = logging.getLogger("twinforge")
-
 
 def get_local_ip() -> str:
-    """Best-effort local network IP (the one phones on the same WiFi can reach)."""
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
     except Exception:
         return "127.0.0.1"
 
 
+def gen_ssl_cert(cert_path: Path, key_path: Path, ip: str):
+    """Generate a self-signed cert valid for the local IP."""
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.backends import default_backend
+        import datetime, ipaddress
+
+        key = rsa.generate_private_key(
+            public_exponent=65537, key_size=2048,
+            backend=default_backend())
+
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "TwinForge3D"),
+        ])
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.utcnow())
+            .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365))
+            .add_extension(x509.SubjectAlternativeName([
+                x509.DNSName("localhost"),
+                x509.IPAddress(ipaddress.IPv4Address(ip)),
+                x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+            ]), critical=False)
+            .sign(key, hashes.SHA256(), default_backend())
+        )
+
+        key_path.write_bytes(key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption()))
+        cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        return True
+
+    except ImportError:
+        # Fallback: openssl command
+        try:
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                "-keyout", str(key_path), "-out", str(cert_path),
+                "-days", "365", "-nodes", "-subj",
+                f"/CN=TwinForge3D",
+                "-addext", f"subjectAltName=IP:{ip},IP:127.0.0.1,DNS:localhost"
+            ], check=True, capture_output=True)
+            return True
+        except Exception as e:
+            print(f"  [warn] Could not generate SSL cert: {e}")
+            return False
+
+
 def print_qr(url: str):
-    """Print a QR code to the terminal (uses qrcode if available)."""
     try:
         import qrcode
         qr = qrcode.QRCode(border=1)
@@ -49,82 +90,67 @@ def print_qr(url: str):
         qr.make(fit=True)
         qr.print_ascii(invert=True)
     except ImportError:
-        print("  (pip install qrcode to show a scannable QR code)")
-
-
-def print_banner(host: str, port: int):
-    ip  = get_local_ip()
-    url = f"http://{ip}:{port}"
-    width = 62
-
-    print()
-    print("=" * width)
-    print("  TwinForge 3D — Server Running")
-    print("=" * width)
-    print(f"  Local:   http://localhost:{port}")
-    print(f"  Network: {url}   ← open on your phone")
-    print()
-    print("  PHONE SETUP:")
-    print(f"  1. Connect phone to the SAME Wi-Fi as this PC")
-    print(f"  2. Scan the QR code below OR type: {url}")
-    print(f"  3. Tap 'Start Scanning' and walk around your robot")
-    print()
-    print("-" * width)
-    print_qr(url)
-    print("-" * width)
-    print()
-    print("  3D VIEWER  (PC browser):")
-    print(f"  http://localhost:{port}/viewer/demo")
-    print()
-    print("  Press Ctrl+C to stop")
-    print("=" * width)
-    print()
-
-
-def open_demo_job(port: int):
-    """Pre-process a demo job so the 3D viewer is immediately ready."""
-    import time as _time
-    _time.sleep(1.5)   # wait for server to boot
-
-    try:
-        import requests
-
-        # Create job
-        r = requests.post(f"http://localhost:{port}/jobs/create")
-        job_id = r.json()["job_id"]
-
-        # Start pipeline (no frames → demo mode)
-        requests.post(f"http://localhost:{port}/jobs/{job_id}/run",
-                      json={"robot_name": "demo_arm"})
-
-        log.info(f"Demo job started: {job_id}")
-        log.info(f"3D viewer: http://localhost:{port}/viewer/{job_id}")
-
-        # Open browser
-        webbrowser.open(f"http://localhost:{port}/viewer/{job_id}")
-
-    except Exception as e:
-        log.debug(f"Demo auto-launch skipped: {e}")
+        print(f"  (install qrcode for QR: pip install qrcode)")
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--host",  default="0.0.0.0")
-    p.add_argument("--port",  type=int, default=8000)
-    p.add_argument("--demo",  action="store_true",
-                   help="Auto-run demo job and open browser")
-    args = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=8443)
+    parser.add_argument("--http", action="store_true",
+                        help="HTTP only (camera won't work on phone)")
+    args = parser.parse_args()
 
-    print_banner(args.host, args.port)
+    ip   = get_local_ip()
+    port = args.port
+    use_ssl = not args.http
 
-    if args.demo:
-        t = threading.Thread(target=open_demo_job, args=(args.port,), daemon=True)
-        t.start()
+    ssl_cert = ssl_key = None
+    cert_dir = ROOT / ".ssl"
+    cert_dir.mkdir(exist_ok=True)
+    cert_path = cert_dir / "cert.pem"
+    key_path  = cert_dir / "key.pem"
 
-    # Start FastAPI server
+    if use_ssl:
+        print("  Generating self-signed SSL cert…", end=" ", flush=True)
+        ok = gen_ssl_cert(cert_path, key_path, ip)
+        if ok:
+            ssl_cert = str(cert_path)
+            ssl_key  = str(key_path)
+            print("done ✓")
+        else:
+            use_ssl = False
+            port    = args.port if args.port != 8443 else 8000
+            print("skipped — running HTTP (camera may not work)")
+
+    scheme = "https" if use_ssl else "http"
+    net_url = f"{scheme}://{ip}:{port}"
+
+    print()
+    print("=" * 60)
+    print("  TwinForge 3D — Server")
+    print("=" * 60)
+    print(f"  Local:   {scheme}://localhost:{port}")
+    print(f"  Network: {net_url}   ← open on your phone")
+    if use_ssl:
+        print()
+        print("  ⚠️  PHONE SETUP (one-time only):")
+        print(f"  1. Open {net_url} on your phone")
+        print("  2. Tap 'Advanced' → 'Proceed to site' (it's safe — self-signed)")
+        print("  3. Camera will work after you accept the warning")
+    print()
+    print("  Scan this QR code with your phone:")
+    print("-" * 60)
+    print_qr(net_url)
+    print("-" * 60)
+    print(f"  3D Viewer (PC): {scheme}://localhost:{port}/viewer/demo")
+    print()
+    print("  Press Ctrl+C to stop")
+    print("=" * 60)
+    print()
+
     from server.app import run_server
-    run_server(host=args.host, port=args.port)
+    run_server(host="0.0.0.0", port=port,
+               ssl_keyfile=ssl_key, ssl_certfile=ssl_cert)
 
 
 if __name__ == "__main__":

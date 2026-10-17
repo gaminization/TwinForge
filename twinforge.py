@@ -1,136 +1,134 @@
 #!/usr/bin/env python3
 """
-TwinForge 3D — single entry point
-
-Usage examples
---------------
-# Demo (no hardware): generates synthetic 4-DOF arm, shows it moving
-python twinforge.py --demo
-
-# From a .ply / .pcd scan
-python twinforge.py --input scan.ply --name my_arm
-
-# From a folder of RGB-D image pairs
-python twinforge.py --input scan_folder/ --name my_arm
-
-# From a video file (phone scan)
-python twinforge.py --input robot_video.mp4 --name my_arm
-
-# Headless (saves PNG frames + MP4, no window)
-python twinforge.py --demo --headless --output output/
+TwinForge 3D — CLI
+Usage:
+  python3 twinforge.py --demo
+  python3 twinforge.py --input scan.ply --name my_robot --links 5
+  python3 twinforge.py --images photos/ --links 5 --joints joints.json
 """
-
-import argparse
-import logging
-import sys
-import time
+import argparse, logging, sys, time
 from pathlib import Path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(levelname)s] %(name)s: %(message)s",
-)
+logging.basicConfig(level=logging.INFO,
+    format="[%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("twinforge")
+
+ROOT = Path(__file__).parent
+sys.path.insert(0, str(ROOT))
+
+
+def run_articulated(args, out, t0):
+    """Rest scan + one scan per joint -> automatically detected joints -> URDF."""
+    import json
+    from core.articulated import load_mesh, build_from_scans
+    from core.urdf_builder import build
+    from core import urdf_builder
+    import open3d as o3d
+    work = out / "work"; work.mkdir(exist_ok=True)
+    log.info("Step 1/4 - Reconstructing rest scan and %d joint scans ...", len(args.joint_scans))
+    rest = load_mesh(args.rest, work, size_m=args.size_m)
+    scans = [load_mesh(s, work) for s in args.joint_scans]
+    log.info("Step 2/4 - Detecting links and joints from the motion between scans ...")
+    comps, joints, res = build_from_scans(rest, scans)
+    o3d.io.write_triangle_mesh(str(out / "scan_mesh.ply"), rest)
+    log.info("Step 3/4 - Building URDF ...")
+    urdf_path = build(comps, joints, args.name, out)
+    (out / "meta.json").write_text(json.dumps({
+        "robot_name": args.name, "urdf_url": "/jobs/demo/urdf", "n_links": len(comps), "n_joints": len(joints),
+        "links": [{"id": c.id, "label": c.label, "mesh_url": f"/jobs/demo/meshes/{c.id}.stl"} for c in comps],
+        "joints": [{"id": j.id, "parent": j.parent_id, "child": j.child_id, "type": j.type,
+                    "origin_xyz": [float(v) for v in j.origin_xyz], "origin_rpy": [float(v) for v in j.origin_rpy],
+                    "axis": j.axis.tolist(), "limit_lower": j.limit_lower, "limit_upper": j.limit_upper,
+                    "confidence": j.confidence} for j in urdf_builder.build.relative_joints]}, indent=2))
+    print("\nURDF:", urdf_path, " (%.0fs)" % (time.time() - t0))
+    for j in res.joints:
+        print(f"  {j.name}: {j.parent}->{j.child} {j.type} axis={j.axis.round(3)} observed={j.observed:.2f} "
+              f"rms={j.rms_mm:.1f}mm confidence={j.confidence}")
+    low = [j.name for j in res.joints if j.confidence == "low"]
+    if low:
+        print(f"  WARNING: low confidence for {', '.join(low)} - recapture those scans (rotate the joint 30-60 deg, "
+              "keep everything else still, cover the robot from all sides) before trusting the URDF.")
+    print("  NOTE: joint limits are defaults around the observed motion; edit them if you know the real ones.")
 
 
 def run(args):
-    from core.acquisition   import load
-    from core.segmenter     import segment
+    from core.acquisition    import load
+    from core.segmenter      import segment
     from core.joint_detector import detect
-    from core.urdf_builder  import build
-    from core.visualizer    import run_interactive, save_frames
+    from core.kinematic_tree import KinematicTreeBuilder
+    from core.urdf_builder   import build
+    from core.visualizer     import save_frames, show_interactive
 
-    out = Path(args.output)
-    out.mkdir(parents=True, exist_ok=True)
-
-    # ── 1. Acquire ────────────────────────────────────────────────────────
+    out = ROOT / "output"
+    out.mkdir(exist_ok=True)
     t0 = time.time()
+
+    if args.rest:
+        return run_articulated(args, out, t0)
+
     log.info("Step 1/5 — Acquiring scan data …")
-    scan = load(
-        source=args.input,
-        demo=args.demo,
-        n_poses=args.poses,
-    )
-    log.info(f"  → {len(scan.pcd.points):,} points  ({time.time()-t0:.1f}s)")
+    t = time.time()
+    scan = load(source=args.input or args.images, demo=args.demo,
+                backend=args.backend, size_m=args.size_m)
+    if args.size_m and not args.demo:
+        import numpy as np
+        ext = np.asarray(scan.pcd.get_max_bound()) - np.asarray(scan.pcd.get_min_bound())
+        k = args.size_m / float(ext.max())
+        scan.pcd.scale(k, center=(0, 0, 0))
+        log.info(f"  Rescaled so the longest side = {args.size_m} m (x{k:.4g})")
+    if args.images:
+        import open3d as o3d
+        o3d.io.write_point_cloud(str(out / "scan.ply"), scan.pcd)
+        if getattr(scan, "mesh", None) is not None:
+            o3d.io.write_triangle_mesh(str(out / "scan_mesh.ply"), scan.mesh)
+        log.info(f"  Saved reconstructed scan -> {out/'scan_mesh.ply'} (reuse with --input)")
+    log.info(f"  → {len(scan.pcd.points):,} points  ({time.time()-t:.1f}s)")
 
-    # ── 2. Segment ────────────────────────────────────────────────────────
-    t1 = time.time()
     log.info("Step 2/5 — Segmenting components …")
-    components = segment(
-        scan,
-        voxel=args.voxel,
-        eps=args.eps,
-        min_pts=args.min_pts,
-    )
-    log.info(f"  → {len(components)} component(s)  ({time.time()-t1:.1f}s)")
-    for c in components:
-        log.info(f"     {c.id:10s}  {c.type:14s}  pts={c.n_points:5d}  "
-                 f"extent={c.extent.round(3)}")
+    t = time.time()
+    comps = segment(scan, n_links=args.links, joints_path=args.joints)
+    log.info(f"  → {len(comps)} component(s)  ({time.time()-t:.1f}s)")
+    for c in comps:
+        log.info(f"     {c.id:<12} {c.label:<16} pts={len(c.pcd.points):>5}  "
+                 f"extent={c.extent}")
 
-    if len(components) < 2:
-        log.error("Need ≥2 components to build a robot. "
-                  "Try lowering --eps or --min-pts, or use --demo.")
-        sys.exit(1)
-
-    # ── 3. Detect joints ──────────────────────────────────────────────────
-    t2 = time.time()
     log.info("Step 3/5 — Detecting joints …")
-    joints = detect(components, scan_data=scan)
-    log.info(f"  → {len(joints)} joint(s)  ({time.time()-t2:.1f}s)")
+    t = time.time()
+    joints = detect(comps, scan_data=scan, overrides_path=args.joints)
+    if not args.demo and not args.joints:
+        from core.joint_detector import write_template
+        write_template(joints, out / 'joints_template.json')
+        log.warning('Joint axes/limits from a static scan are GUESSES. Edit output/joints_template.json and rerun with --joints to confirm them.')
+    log.info(f"  → {len(joints)} joint(s)  ({time.time()-t:.1f}s)")
 
-    if not joints:
-        log.error("No joints detected. Try --demo to verify the pipeline.")
-        sys.exit(1)
-
-    # ── 4. Build URDF ─────────────────────────────────────────────────────
-    t3 = time.time()
     log.info("Step 4/5 — Building URDF …")
-    urdf_path = build(
-        components=components,
-        joints=joints,
-        robot_name=args.name,
-        output_dir=out,
-    )
-    log.info(f"  → {urdf_path}  ({time.time()-t3:.1f}s)")
+    t = time.time()
+    urdf_path = build(comps, joints, args.name, out)
+    log.info(f"  → {urdf_path}  ({time.time()-t:.1f}s)")
 
-    # Print summary
-    _print_summary(components, joints, urdf_path, time.time()-t0)
+    # Metadata for the web viewer (server serves it at /jobs/demo/meta)
+    import json
+    from core import urdf_builder
+    (out / "meta.json").write_text(json.dumps({
+        "robot_name": args.name, "urdf_url": "/jobs/demo/urdf",
+        "n_links": len(comps), "n_joints": len(joints),
+        "links": [{"id": c.id, "label": c.label, "mesh_url": f"/jobs/demo/meshes/{c.id}.stl"} for c in comps],
+        "joints": [{"id": j.id, "parent": j.parent_id, "child": j.child_id, "type": j.type,
+                    "origin_xyz": [float(v) for v in j.origin_xyz], "origin_rpy": [float(v) for v in j.origin_rpy],
+                    "axis": j.axis.tolist(), "limit_lower": j.limit_lower, "limit_upper": j.limit_upper,
+                    "confidence": j.confidence} for j in urdf_builder.build.relative_joints]}, indent=2))
 
-    # ── 5. Visualise ──────────────────────────────────────────────────────
-    log.info("Step 5/5 — Launching visualiser …")
-    if args.headless:
-        frames_dir = out / "frames"
-        save_frames(
-            urdf_path=urdf_path,
-            output_dir=frames_dir,
-            components=components,
-            n_frames=args.frames,
-            period=args.period,
-        )
-        log.info(f"Frames saved to {frames_dir}/")
-        log.info("Run without --headless to open the interactive viewer.")
-    else:
-        run_interactive(
-            urdf_path=urdf_path,
-            components=components,
-            n_frames=args.frames,
-            period=args.period,
-        )
-
-    return urdf_path
-
-
-def _print_summary(components, joints, urdf_path, elapsed):
-    width = 60
-    print(f"\n{'='*width}")
-    print(f"  TwinForge 3D — Complete  ({elapsed:.1f}s)")
-    print(f"{'='*width}")
-    print(f"  URDF:    {urdf_path}")
-    print(f"  Meshes:  {urdf_path.parent / 'meshes'}")
+    total = time.time() - t0
     print()
-    print(f"  Components ({len(components)}):")
-    for c in components:
-        print(f"    {c.id:12s}  {c.type:14s}  movable={c.movable}")
+    print("=" * 60)
+    print(f"  TwinForge 3D — Complete  ({total:.1f}s)")
+    print("=" * 60)
+    print(f"  URDF:    {urdf_path}")
+    print(f"  Meshes:  {out}/meshes")
+    print()
+    print(f"  Components ({len(comps)}):")
+    for c in comps:
+        print(f"    {c.id:<12} {c.label:<16} movable={c.movable}")
     print()
     print(f"  Joints ({len(joints)}):")
     for j in joints:
@@ -139,57 +137,46 @@ def _print_summary(components, joints, urdf_path, elapsed):
         print(f"      limits=[{j.limit_lower:.3f}, {j.limit_upper:.3f}]  "
               f"conf={j.confidence:.2f}")
     print()
-    print(f"  To open in RViz (requires ROS 2):")
-    print(f"    ros2 launch {urdf_path.parent}/launch_rviz.py")
-    print(f"{'='*width}\n")
+    print("  To launch server:")
+    print("    python3 start_server.py")
+    print("=" * 60)
+    print()
+
+    if not args.no_viewer:
+        log.info("Step 5/5 — Rendering animation …")
+        frames_dir = out / "frames"
+        frames = save_frames(urdf_path, frames_dir, components=comps, n_frames=36)
+        log.info(f"  → {len(frames)} frames saved to {frames_dir}")
+
+        if not args.headless:
+            try:
+                show_interactive(comps, joints)
+            except Exception as e:
+                log.warning(f"Interactive viewer unavailable: {e}")
 
 
 def main():
-    p = argparse.ArgumentParser(
-        description="TwinForge 3D — scan a robot, get a URDF, see it move",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-
-    # Input
-    grp = p.add_mutually_exclusive_group()
-    grp.add_argument("--demo",  action="store_true",
-                     help="Run with synthetic 4-DOF arm (no hardware needed)")
-    grp.add_argument("--input", metavar="PATH",
-                     help=".ply / .pcd / image-folder / video file")
-
-    # Robot
-    p.add_argument("--name",   default="robot",
-                   help="Robot name (used in URDF and output filenames)")
-    p.add_argument("--output", default="output",
-                   help="Output directory  [default: output/]")
-    p.add_argument("--poses",  type=int, default=3,
-                   help="Number of poses to capture for motion-based axis fitting"
-                        "  [default: 3]")
-
-    # Segmentation tuning
-    p.add_argument("--voxel",   type=float, default=0.005,
-                   help="Voxel size for downsampling  [default: 0.005 m]")
-    p.add_argument("--eps",     type=float, default=0.025,
-                   help="DBSCAN neighbourhood radius  [default: 0.025 m]")
-    p.add_argument("--min-pts", type=int,   default=80, dest="min_pts",
-                   help="DBSCAN min points per cluster  [default: 80]")
-
-    # Visualiser
-    p.add_argument("--headless", action="store_true",
-                   help="Save frames instead of opening a window")
-    p.add_argument("--frames",  type=int,   default=300,
-                   help="Animation frames  [default: 300]")
-    p.add_argument("--period",  type=float, default=4.0,
-                   help="Animation period in seconds  [default: 4.0]")
-
+    p = argparse.ArgumentParser(description="TwinForge 3D — Robot Digital Twin Generator")
+    src = p.add_mutually_exclusive_group()
+    src.add_argument("--demo",  action="store_true", help="Use built-in demo arm")
+    src.add_argument("--input", metavar="FILE",       help="PLY/PCD scan file")
+    src.add_argument("--images", metavar="DIR",       help="Folder of photos to reconstruct (VGGT/DUSt3R/SIFT)")
+    p.add_argument("--rest", metavar="DIR_OR_PLY", help="Rest-pose scan (mesh or photo folder); use with --joint-scans")
+    p.add_argument("--joint-scans", nargs="+", metavar="DIR_OR_PLY", default=[],
+                   help="One scan per joint, in any order, each with ONLY that joint moved >=20 degrees")
+    p.add_argument("--backend", choices=["auto", "neural", "sfm", "sift"], default="auto",
+                   help="Photo reconstruction backend (see README)")
+    p.add_argument("--links",  type=int, default=6,   help="Number of rigid links to segment into")
+    p.add_argument("--size-m", type=float, default=None, help="Real longest dimension of the object in metres (fixes scale of neural/SfM scans)")
+    p.add_argument("--joints", metavar="JSON",        help="User-confirmed joints (see output/joints_template.json)")
+    p.add_argument("--name",       default="robot",  help="Robot name")
+    p.add_argument("--headless",   action="store_true")
+    p.add_argument("--no-viewer",  action="store_true")
     args = p.parse_args()
-
-    if not args.demo and not args.input:
-        p.print_help()
-        print("\nTip: run  python twinforge.py --demo  to try it right now.\n")
-        sys.exit(0)
-
+    if not args.demo and not args.input and not args.images and not args.rest:
+        args.demo = True
+    if args.rest and not args.joint_scans:
+        p.error('--rest needs --joint-scans')
     run(args)
 
 

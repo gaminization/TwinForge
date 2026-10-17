@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# TwinForge local runtime & artifacts
+.ssl/
+output/
+server/jobs/
+vggt/
+*.pem
+*.key

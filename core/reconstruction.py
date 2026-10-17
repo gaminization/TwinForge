@@ -1,559 +1,523 @@
 """
-RGB-Only Dense Reconstruction
-==============================
-Takes phone JPEG frames → dense point cloud suitable for segmentation.
+reconstruction.py — Incremental 3D reconstruction from phone photos.
 
-Pipeline
---------
-1. Feature extraction  — SIFT on all frames
-2. Pairwise matching   — BFMatcher + Lowe's ratio test
-3. Pose recovery       — Essential matrix → R, t per pair
-4. Chained poses       — Accumulate camera poses via PnP
-5. Triangulation       — All matched pairs → 3D points
-6. Dense patch match   — Semi-dense stereo between close frames
-7. Outlier removal     — Statistical filter + voxel downsample
-8. Coverage analysis   — Which angles are seen, which joints need more
+Backend priority:
+  1. VGGT  (CVPR 2025 Best Paper — facebook/VGGT-1B)
+     Dense per-pixel point maps, accurate poses, no COLMAP needed.
+  2. DUSt3R (CVPR 2024 — naver/dust3r)
+     Dense stereo reconstruction, global alignment.
+  3. Enhanced SIFT SfM (always available, no GPU needed)
+     SIFT + RANSAC Essential matrix + triangulation + dense SGM.
 
-Used by: server/app.py (incremental), core/acquisition.py (batch)
+Install neural backends (run once):
+  pip install torch torchvision huggingface_hub
+  # VGGT:
+  pip install git+https://github.com/facebookresearch/vggt.git
+  # DUSt3R:
+  git clone --recursive https://github.com/naver/dust3r && pip install -e dust3r/
 """
-
-from __future__ import annotations
+import cv2
+import numpy as np
+import open3d as o3d
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-import numpy as np
-import cv2
+from typing import List, Optional, Tuple
 
-log = logging.getLogger(__name__)
-
-
-# ── Data containers ───────────────────────────────────────────────────────────
-
-@dataclass
-class CameraFrame:
-    idx:       int
-    image:     np.ndarray          # H×W×3 uint8 RGB
-    path:      Optional[Path] = None
-    K:         Optional[np.ndarray] = None   # 3×3 intrinsics
-    R:         Optional[np.ndarray] = None   # 3×3 rotation (world ← camera)
-    t:         Optional[np.ndarray] = None   # 3   translation
-    kp:        list = field(default_factory=list)   # cv2.KeyPoint list
-    des:       Optional[np.ndarray] = None          # SIFT descriptors
+log = logging.getLogger("twinforge.reconstruction")
 
 
 @dataclass
-class ReconstructionResult:
-    points:    np.ndarray          # N×3 float32
-    colors:    Optional[np.ndarray] = None   # N×3 uint8
-    cameras:   List[CameraFrame] = field(default_factory=list)
-    n_frames:  int = 0
-    coverage:  Dict[str, float] = field(default_factory=dict)
-    # Coverage analysis outputs
-    angles_seen:  List[float] = field(default_factory=list)   # degrees, 0-360
-    needs_angles: List[str]   = field(default_factory=list)   # e.g. ["left side", "top"]
+class FrameResult:
+    frame_idx:       int
+    n_points:        int
+    total_points:    int
+    coverage:        float
+    guidance:        str
+    covered_sectors: List[int]
+    backend:         str = "sift"
 
 
-# ── Main entry point ──────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Backend detection
+# ─────────────────────────────────────────────────────────────
 
-def reconstruct_from_frames(frames: List[np.ndarray],
-                              min_points: int = 500) -> ReconstructionResult:
+def _detect_backend() -> str:
+    try:
+        import torch
+        try:
+            import vggt          # noqa
+            return "vggt"
+        except ImportError:
+            pass
+        try:
+            import dust3r        # noqa
+            return "dust3r"
+        except ImportError:
+            pass
+        return "sift"
+    except ImportError:
+        return "sift"
+
+
+# ─────────────────────────────────────────────────────────────
+# IncrementalReconstructor — thin wrapper that dispatches
+# ─────────────────────────────────────────────────────────────
+
+class IncrementalReconstructor:
+    N_SECTORS   = 12
+    MIN_COVERAGE = 0.75
+
+    def __init__(self, job_dir: Path):
+        self.job_dir  = Path(job_dir)
+        self._backend = _detect_backend()
+        log.info(f"Reconstruction backend: {self._backend.upper()}")
+        self._impl = _make_impl(self._backend, self.job_dir)
+
+    def add_frame(self, img_bytes: bytes) -> FrameResult:
+        return self._impl.add_frame(img_bytes)
+
+    def get_pcd(self, voxel_size: float = 0.002) -> o3d.geometry.PointCloud:
+        return self._impl.get_pcd(voxel_size)
+
+    @property
+    def coverage(self) -> float:
+        return self._impl.coverage
+
+    @property
+    def is_complete(self) -> bool:
+        return self.coverage >= self.MIN_COVERAGE
+
+
+def _make_impl(backend: str, job_dir: Path):
+    if backend == "vggt":
+        try:
+            return _VGGTReconstructor(job_dir)
+        except Exception as e:
+            log.warning(f"VGGT init failed ({e}), trying DUSt3R…")
+            backend = "dust3r"
+    if backend == "dust3r":
+        try:
+            return _DUSt3RReconstructor(job_dir)
+        except Exception as e:
+            log.warning(f"DUSt3R init failed ({e}), using SIFT fallback")
+    return _SIFTReconstructor(job_dir)
+
+
+# ─────────────────────────────────────────────────────────────
+# VGGT backend  (CVPR 2025 Best Paper)
+# ─────────────────────────────────────────────────────────────
+
+class _VGGTReconstructor:
     """
-    Full RGB-only SfM reconstruction.
-
-    Parameters
-    ----------
-    frames     : list of H×W×3 uint8 RGB images
-    min_points : minimum points before giving up and using fallback
-
-    Returns
-    -------
-    ReconstructionResult with points array ready for segmentation
+    Uses facebook/VGGT-1B to get dense per-pixel point maps from images.
+    Requires: pip install torch torchvision huggingface_hub vggt
     """
-    if len(frames) < 2:
-        raise ValueError("Need at least 2 frames for reconstruction")
 
-    log.info(f"Reconstructing from {len(frames)} frames …")
+    def __init__(self, job_dir: Path):
+        import torch
+        from vggt.models.vggt import VGGT
+        from vggt.utils.load_fn import load_and_preprocess_images
 
-    # 1. Build CameraFrame objects + estimate intrinsics
-    cam_frames = _prepare_frames(frames)
+        self._torch = torch
+        self._load_images = load_and_preprocess_images
+        self.job_dir = Path(job_dir)
 
-    # 2. Extract SIFT features
-    _extract_features(cam_frames)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._device = device
+        log.info(f"VGGT: loading model on {device}…")
+        self._model = VGGT.from_pretrained("facebook/VGGT-1B").to(device).eval()
+        log.info("VGGT: model ready")
 
-    # 3. Pairwise matching + pose recovery
-    pts3d, colors = _sfm_pipeline(cam_frames)
+        self._frame_paths: List[Path] = []
+        self._all_pts:  List[np.ndarray] = []
+        self._all_clr:  List[np.ndarray] = []
+        self._sector_hits = np.zeros(12, dtype=int)
 
-    # 4. Dense patch matching between adjacent frames
-    dense_pts, dense_cols = _dense_patch_match(cam_frames)
-    if len(dense_pts) > 100:
-        pts3d  = np.vstack([pts3d,  dense_pts])
-        colors = np.vstack([colors, dense_cols])
+    MAX_FRAMES = 24          # cap per forward pass (VRAM); evenly subsampled
+    CONF_KEEP  = 0.5         # keep the most confident 50% of pixels
 
-    # 5. Clean up
-    pts3d, colors = _clean(pts3d, colors)
+    def add_frame(self, img_bytes: bytes) -> FrameResult:
+        import torch
+        from vggt.utils.geometry import unproject_depth_map_to_point_map
+        from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-    # 6. Coverage analysis
-    coverage, angles_seen, needs = _analyse_coverage(cam_frames, pts3d)
+        idx  = len(self._frame_paths)
+        path = self.job_dir / f"vggt_{idx:04d}.jpg"
+        path.write_bytes(img_bytes)
+        self._frame_paths.append(path)
 
-    log.info(f"Reconstruction: {len(pts3d):,} points, "
-             f"coverage={coverage.get('angular', 0):.0%}, "
-             f"needs={needs}")
+        if len(self._frame_paths) < 2:
+            return FrameResult(idx, 0, 0, 0.0,
+                               "Capture a second view to start reconstruction",
+                               [], backend="vggt")
 
-    return ReconstructionResult(
-        points=pts3d.astype(np.float32),
-        colors=colors,
-        cameras=cam_frames,
-        n_frames=len(frames),
-        coverage=coverage,
-        angles_seen=angles_seen,
-        needs_angles=needs,
-    )
+        # Frames used this pass (evenly subsampled if there are many)
+        paths = self._frame_paths
+        if len(paths) > self.MAX_FRAMES:
+            sel = np.linspace(0, len(paths) - 1, self.MAX_FRAMES).round().astype(int)
+            paths = [paths[i] for i in sel]
+        images = self._load_images([str(p) for p in paths], mode="crop")   # (S,3,H,W) in [0,1]
+
+        use_cuda = torch.cuda.is_available() and self._device.startswith("cuda")
+        dtype = (torch.bfloat16 if use_cuda and torch.cuda.get_device_capability()[0] >= 8
+                 else torch.float16 if use_cuda else torch.bfloat16)
+
+        with torch.no_grad():
+            with torch.autocast(device_type="cuda" if use_cuda else "cpu", dtype=dtype):
+                preds = self._model(images.to(self._device))
+
+            # VGGT returns a dict of batched tensors: pose_enc (B,S,9), depth (B,S,H,W,1),
+            # depth_conf (B,S,H,W).  Decode OpenCV world->camera extrinsics + intrinsics.
+            extri, intri = pose_encoding_to_extri_intri(
+                preds["pose_enc"].float(), images.shape[-2:])
+            extri  = extri[0].float().cpu().numpy()              # (S,3,4)
+            intri  = intri[0].float().cpu().numpy()              # (S,3,3)
+            depth  = preds["depth"][0].float().cpu().numpy()     # (S,H,W,1)
+            conf   = preds["depth_conf"][0].float().cpu().numpy()  # (S,H,W)
+
+        world = unproject_depth_map_to_point_map(depth, extri, intri)   # (S,H,W,3)
+        rgb   = images.float().permute(0, 2, 3, 1).cpu().numpy()                # (S,H,W,3)
+
+        thr  = np.quantile(conf, 1.0 - self.CONF_KEEP)
+        mask = (conf >= thr) & (depth[..., 0] > 0) & np.isfinite(world).all(-1)
+        pts_all = world[mask]
+        clr_all = rgb[mask]
+
+        # Each pass is expressed in the first frame's coordinates, so REPLACE (never append).
+        self._all_pts = [pts_all]
+        self._all_clr = [clr_all]
+
+        # Coverage: azimuth of each camera around the scene centre.
+        R, t = extri[:, :, :3], extri[:, :, 3]
+        centres = -np.einsum("sij,sj->si", R.transpose(0, 2, 1), t)    # camera centres in world
+        mid = np.median(pts_all, axis=0) if len(pts_all) else centres.mean(0)
+        self._sector_hits[:] = 0
+        for c in centres:
+            az = np.degrees(np.arctan2(c[1] - mid[1], c[0] - mid[0]))
+            self._sector_hits[int((az % 360) / 30) % 12] += 1
+
+        cov = float(np.sum(self._sector_hits > 0)) / 12
+        covered = [i for i, h in enumerate(self._sector_hits) if h > 0]
+        return FrameResult(idx, len(pts_all), len(pts_all), cov,
+                           _guidance(cov, self._sector_hits), covered, backend="vggt")
+
+    def get_pcd(self, voxel_size=0.002) -> o3d.geometry.PointCloud:
+        if not self._all_pts:
+            return o3d.geometry.PointCloud()
+        pts = np.vstack(self._all_pts)
+        clr = np.vstack(self._all_clr)
+        return _build_pcd(pts, clr, voxel_size)
+
+    @property
+    def coverage(self) -> float:
+        return float(np.sum(self._sector_hits > 0)) / 12
 
 
-def to_open3d_pcd(result: ReconstructionResult):
-    """Convert ReconstructionResult → open3d.geometry.PointCloud."""
-    import open3d as o3d
+# ─────────────────────────────────────────────────────────────
+# DUSt3R backend  (CVPR 2024)
+# ─────────────────────────────────────────────────────────────
+
+class _DUSt3RReconstructor:
+    """
+    Uses naver/DUSt3R for pairwise dense 3D reconstruction + global alignment.
+    Requires: git clone --recursive https://github.com/naver/dust3r; pip install -e dust3r/
+    Model: DUSt3R_ViTLarge_BaseDecoder_512_dpt (auto-downloaded from HuggingFace)
+    """
+
+    MODEL_NAME = "naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt"
+
+    def __init__(self, job_dir: Path):
+        import torch
+        from dust3r.model import AsymmetricCroCo3DStereo
+        from dust3r.utils.image import load_images
+        from dust3r.inference import inference
+        from dust3r.post_process import estimate_focal_knowing_depth
+        from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
+
+        self._torch   = torch
+        self._load    = load_images
+        self._infer   = inference
+        self._ga      = global_aligner
+        self._GAMode  = GlobalAlignerMode
+        self.job_dir  = Path(job_dir)
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._device  = device
+        log.info(f"DUSt3R: loading model on {device}…")
+        self._model   = AsymmetricCroCo3DStereo.from_pretrained(
+            self.MODEL_NAME).to(device).eval()
+        log.info("DUSt3R: model ready")
+
+        self._frame_paths: List[Path] = []
+        self._all_pts: List[np.ndarray] = []
+        self._all_clr: List[np.ndarray] = []
+        self._sector_hits = np.zeros(12, dtype=int)
+
+    def add_frame(self, img_bytes: bytes) -> FrameResult:
+        idx  = len(self._frame_paths)
+        path = self.job_dir / f"dust3r_{idx:04d}.jpg"
+        path.write_bytes(img_bytes)
+        self._frame_paths.append(path)
+
+        if len(self._frame_paths) < 2:
+            return FrameResult(idx, 0, 0, 0.0,
+                               "📸 Capture a second view to start reconstruction",
+                               [], backend="dust3r")
+
+        # Reconstruct using latest pair + all previous
+        paths = [str(p) for p in self._frame_paths[-10:]]
+        try:
+            images = self._load(paths, size=512)
+            pairs  = _make_pairs(images)
+            output = self._infer(pairs, self._model, self._device,
+                                 batch_size=1, verbose=False)
+            scene  = self._ga(output, self._GAMode.GLOBAL_POINTS_SMOOTHED)
+            scene.compute_global_alignment(init="mst", niter=50, schedule="linear")
+
+            pts3d = scene.get_pts3d()
+            masks = scene.get_masks()
+            imgs  = scene.imgs
+
+            pts_new, clr_new = [], []
+            for pts, msk, img in zip(pts3d, masks, imgs):
+                pts_np = pts.detach().cpu().numpy()
+                msk_np = msk.detach().cpu().numpy().astype(bool)
+                img_np = img  # H×W×3 float [0,1]
+                pts_new.append(pts_np[msk_np])
+                clr_new.append(img_np[msk_np])
+
+                # Yaw from scene camera pose
+                cam = scene.get_im_poses()
+                if len(cam) > 0:
+                    R = cam[-1].detach().cpu().numpy()[:3,:3]
+                    yaw = float(np.degrees(np.arctan2(R[1,0], R[0,0])))
+                    sector = int((yaw % 360) / 30) % 12
+                    self._sector_hits[sector] += 1
+
+            self._all_pts.extend(pts_new)
+            self._all_clr.extend(clr_new)
+
+        except Exception as e:
+            log.warning(f"DUSt3R reconstruction error: {e}")
+
+        total  = sum(len(p) for p in self._all_pts)
+        cov    = float(np.sum(self._sector_hits > 0)) / 12
+        covered = [i for i,h in enumerate(self._sector_hits) if h > 0]
+        return FrameResult(idx, 0, total, cov,
+                           _guidance(cov, self._sector_hits),
+                           covered, backend="dust3r")
+
+    def get_pcd(self, voxel_size=0.002) -> o3d.geometry.PointCloud:
+        if not self._all_pts:
+            return o3d.geometry.PointCloud()
+        return _build_pcd(np.vstack(self._all_pts),
+                          np.vstack(self._all_clr), voxel_size)
+
+    @property
+    def coverage(self) -> float:
+        return float(np.sum(self._sector_hits > 0)) / 12
+
+
+def _make_pairs(images):
+    """All consecutive + skip-1 pairs."""
+    pairs = []
+    n = len(images)
+    for i in range(n):
+        for j in range(i+1, min(i+3, n)):
+            pairs.append((images[i], images[j]))
+    return pairs
+
+
+# ─────────────────────────────────────────────────────────────
+# Enhanced SIFT SfM fallback (no GPU, no large model)
+# ─────────────────────────────────────────────────────────────
+
+class _SIFTReconstructor:
+    """
+    Classical SfM: SIFT → BF matching → Essential matrix → triangulation.
+    Always available (uses only OpenCV + numpy).
+    Quality: good for 10–50 frames, adequate for robot arms.
+    """
+    MIN_INLIERS = 20
+
+    def __init__(self, job_dir: Path):
+        self.job_dir = Path(job_dir)
+        self._sift   = cv2.SIFT_create(nfeatures=4000, contrastThreshold=0.03)
+        self._bf     = cv2.BFMatcher(cv2.NORM_L2)
+        self._frames : List[np.ndarray] = []
+        self._kps    : List        = []
+        self._descs  : List[np.ndarray] = []
+        self._poses  : List[np.ndarray] = []
+        self._pts    : List[np.ndarray] = []
+        self._clrs   : List[np.ndarray] = []
+        self._sector_hits = np.zeros(12, dtype=int)
+        self._K: Optional[np.ndarray] = None
+
+    def add_frame(self, img_bytes: bytes) -> FrameResult:
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        bgr   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise ValueError("Could not decode image")
+
+        h, w = bgr.shape[:2]
+        if self._K is None:
+            f = max(w, h) * 1.2
+            self._K = np.array([[f,0,w/2],[0,f,h/2],[0,0,1]], dtype=float)
+
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        kp, desc = self._sift.detectAndCompute(gray, None)
+        idx = len(self._frames)
+        self._frames.append(bgr)
+        self._kps.append(kp)
+        self._descs.append(desc)
+
+        new_pts = 0
+        yaw = None
+
+        if idx == 0:
+            self._poses.append(np.eye(4))
+        elif desc is not None and self._descs[-2] is not None:
+            pose, pts3d, clr, yaw = self._process_pair(idx-1, idx, bgr)
+            if pose is not None:
+                self._poses.append(pose)
+                if pts3d is not None and len(pts3d) > 0:
+                    self._pts.append(pts3d)
+                    self._clrs.append(clr)
+                    new_pts = len(pts3d)
+                    if yaw is not None:
+                        sector = int((yaw % 360) / 30) % 12
+                        self._sector_hits[sector] += 1
+            else:
+                self._poses.append(self._poses[-1].copy())
+
+        total   = sum(len(p) for p in self._pts)
+        cov     = float(np.sum(self._sector_hits > 0)) / 12
+        covered = [i for i,h in enumerate(self._sector_hits) if h > 0]
+        return FrameResult(idx, new_pts, total, cov,
+                           _guidance(cov, self._sector_hits),
+                           covered, backend="sift")
+
+    def _process_pair(self, i, j, bgr_j):
+        kp_i, desc_i = self._kps[i], self._descs[i]
+        kp_j, desc_j = self._kps[j], self._descs[j]
+        if desc_i is None or desc_j is None or len(desc_i)<8 or len(desc_j)<8:
+            return None,None,None,None
+
+        raw  = self._bf.knnMatch(desc_i, desc_j, k=2)
+        good = [m for m,n in raw if m.distance < 0.75*n.distance]
+        if len(good) < self.MIN_INLIERS:
+            return None,None,None,None
+
+        pts_i = np.float32([kp_i[m.queryIdx].pt for m in good])
+        pts_j = np.float32([kp_j[m.trainIdx].pt for m in good])
+
+        E, mask = cv2.findEssentialMat(pts_i, pts_j, self._K,
+                                        method=cv2.RANSAC, prob=0.999, threshold=1.0)
+        if E is None or mask is None: return None,None,None,None
+
+        inl = mask.ravel().astype(bool)
+        if inl.sum() < self.MIN_INLIERS: return None,None,None,None
+
+        n_in, R, t, _ = cv2.recoverPose(E, pts_i[inl], pts_j[inl], self._K)
+        if n_in < self.MIN_INLIERS: return None,None,None,None
+
+        pose_i = self._poses[i]
+        R_wi, t_wi = pose_i[:3,:3], pose_i[:3,3:]
+        R_wj = R_wi @ R.T
+        t_wj = t_wi - R_wj @ t
+        pose_j = np.eye(4)
+        pose_j[:3,:3] = R_wj
+        pose_j[:3,3:] = t_wj
+
+        P_i = self._K @ pose_i[:3]
+        P_j = self._K @ pose_j[:3]
+        pts4d = cv2.triangulatePoints(P_i, P_j, pts_i[inl].T, pts_j[inl].T)
+        pts3d = (pts4d[:3] / pts4d[3]).T
+
+        d_i = (R_wi @ pts3d.T + t_wi)[2]
+        d_j = (R_wj @ pts3d.T + t_wj)[2]
+        valid = (d_i>0) & (d_j>0) & (np.linalg.norm(pts3d,axis=1)<5.0)
+        pts3d = pts3d[valid]
+        if len(pts3d) == 0: return pose_j,None,None,None
+
+        h,w  = bgr_j.shape[:2]
+        kp_v = pts_j[inl][valid].astype(int)
+        kp_v[:,0] = np.clip(kp_v[:,0], 0, w-1)
+        kp_v[:,1] = np.clip(kp_v[:,1], 0, h-1)
+        clr = bgr_j[kp_v[:,1], kp_v[:,0]][:,::-1].astype(float)/255.0
+
+        yaw = float(np.degrees(np.arctan2(R_wj[1,0], R_wj[0,0])))
+        return pose_j, pts3d, clr, yaw
+
+    def get_pcd(self, voxel_size=0.002) -> o3d.geometry.PointCloud:
+        if not self._pts:
+            return o3d.geometry.PointCloud()
+        return _build_pcd(np.vstack(self._pts), np.vstack(self._clrs), voxel_size)
+
+    @property
+    def coverage(self) -> float:
+        return float(np.sum(self._sector_hits > 0)) / 12
+
+
+# ─────────────────────────────────────────────────────────────
+# Shared utilities
+# ─────────────────────────────────────────────────────────────
+
+def _build_pcd(pts: np.ndarray, clr: np.ndarray,
+               voxel_size: float) -> o3d.geometry.PointCloud:
+    """Clean + downsample + normals. Scale-adaptive: neural / SfM output has arbitrary units."""
     pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(result.points)
-    if result.colors is not None and len(result.colors) == len(result.points):
-        pcd.colors = o3d.utility.Vector3dVector(
-            result.colors.astype(np.float64) / 255.0)
+    pcd.points = o3d.utility.Vector3dVector(np.asarray(pts, dtype=np.float64))
+    pcd.colors = o3d.utility.Vector3dVector(np.clip(np.asarray(clr, dtype=np.float64), 0, 1))
+    if len(pcd.points) == 0:
+        return pcd
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+    if len(pcd.points) == 0:
+        return pcd
+    # Keep only the dense core (drops far-flung background / sky points), then size voxels
+    # relative to the object instead of assuming metres.
+    ext  = np.asarray(pcd.get_max_bound()) - np.asarray(pcd.get_min_bound())
+    diag = float(np.linalg.norm(ext))
+    if voxel_size > 0:
+        pcd = pcd.voxel_down_sample(diag / 400.0)
+    ext  = np.asarray(pcd.get_max_bound()) - np.asarray(pcd.get_min_bound())
+    diag = float(np.linalg.norm(ext))
+    pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=diag / 60.0, max_nn=30))
+    if len(pcd.points) <= 50000:
+        try:
+            pcd.orient_normals_consistent_tangent_plane(k=15)
+        except Exception:
+            pcd.orient_normals_towards_camera_location(pcd.get_center() + np.array([0, 0, 10 * diag]))
+    else:   # too slow at this size: orient away from the centroid (object-centric scans)
+        c = pcd.get_center(); n = np.asarray(pcd.normals); p = np.asarray(pcd.points)
+        flip = np.einsum("ij,ij->i", n, p - c) < 0
+        n[flip] *= -1
+        pcd.normals = o3d.utility.Vector3dVector(n)
+    log.info(f"Final PCD: {len(pcd.points):,} points")
     return pcd
 
 
-# ── Frame preparation ─────────────────────────────────────────────────────────
-
-def _prepare_frames(frames: List[np.ndarray]) -> List[CameraFrame]:
-    cam_frames = []
-    h, w = frames[0].shape[:2]
-    # Approximate intrinsics: fx = fy ≈ 0.9 * max(w,h) (typical phone)
-    fx = max(w, h) * 0.90
-    K  = np.array([[fx, 0, w/2],
-                   [0, fx, h/2],
-                   [0,  0,   1]], dtype=np.float64)
-
-    for i, img in enumerate(frames):
-        if img.shape[0] > 960:          # resize large frames for speed
-            scale = 960 / img.shape[0]
-            img   = cv2.resize(img, (int(img.shape[1]*scale), 960))
-        cam_frames.append(CameraFrame(idx=i, image=img, K=K.copy()))
-
-    return cam_frames
-
-
-# ── Feature extraction ────────────────────────────────────────────────────────
-
-def _extract_features(frames: List[CameraFrame]):
-    sift = cv2.SIFT_create(nfeatures=4000, contrastThreshold=0.03)
-    for f in frames:
-        gray    = cv2.cvtColor(f.image, cv2.COLOR_RGB2GRAY)
-        f.kp, f.des = sift.detectAndCompute(gray, None)
-    log.info(f"Features: {[len(f.kp) for f in frames]}")
-
-
-# ── SfM pipeline ──────────────────────────────────────────────────────────────
-
-def _sfm_pipeline(frames: List[CameraFrame]
-                   ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Chain-based SfM:
-    frame 0 is world origin.
-    For each subsequent frame, find matches with all previous frames,
-    recover pose via PnP on already-triangulated 3D points,
-    then triangulate new matches.
-    """
-    bf = cv2.BFMatcher(cv2.NORM_L2)
-
-    # Initialise with frame 0
-    frames[0].R = np.eye(3)
-    frames[0].t = np.zeros(3)
-
-    all_pts3d  = []
-    all_colors = []
-
-    # Bootstrap: frames 0 and 1
-    pts3d, colors, pts2d_map = _init_pair(frames[0], frames[1], bf)
-    all_pts3d.extend(pts3d)
-    all_colors.extend(colors)
-
-    # Register remaining frames
-    for i in range(2, len(frames)):
-        _register_frame(frames[i], frames[:i], all_pts3d, bf)
-        new_pts, new_cols = _triangulate_new(frames[i], frames[i-1], bf)
-        all_pts3d.extend(new_pts)
-        all_colors.extend(new_cols)
-
-    pts   = np.array(all_pts3d,  dtype=np.float32) if all_pts3d  else np.zeros((0,3))
-    cols  = np.array(all_colors, dtype=np.uint8)   if all_colors else np.zeros((0,3))
-    return pts, cols
-
-
-def _init_pair(f0: CameraFrame, f1: CameraFrame,
-               bf) -> Tuple[list, list, dict]:
-    """Bootstrap: recover pose of f1 from essential matrix, triangulate."""
-    matches = _match(f0, f1, bf)
-    if len(matches) < 8:
-        f1.R = np.eye(3); f1.t = np.array([0,0,1.])
-        return [], [], {}
-
-    p0 = np.float32([f0.kp[m.queryIdx].pt for m in matches])
-    p1 = np.float32([f1.kp[m.trainIdx].pt for m in matches])
-
-    E, mask = cv2.findEssentialMat(p0, p1, f0.K,
-                                    method=cv2.RANSAC, prob=0.999, threshold=1.0)
-    if E is None or mask is None:
-        f1.R = np.eye(3); f1.t = np.array([0,0,1.])
-        return [], [], {}
-
-    _, R, t, mask2 = cv2.recoverPose(E, p0, p1, f0.K, mask=mask)
-    f1.R = R; f1.t = t.ravel()
-
-    # Triangulate
-    good = mask2.ravel() > 0
-    pts3d, colors = _triangulate(f0, f1, p0[good], p1[good])
-    return pts3d, colors, {}
-
-
-def _register_frame(fi: CameraFrame, prev_frames: List[CameraFrame],
-                     world_pts: list, bf):
-    """Estimate pose of fi by PnP against already-known 3D points."""
-    if not world_pts or fi.des is None:
-        fi.R = np.eye(3); fi.t = np.zeros(3); return
-
-    # Match against last frame (most overlap)
-    last = prev_frames[-1]
-    if last.des is None or last.R is None:
-        fi.R = last.R if last.R is not None else np.eye(3)
-        fi.t = last.t if last.t is not None else np.zeros(3)
-        return
-
-    matches = _match(last, fi, bf, max_matches=200)
-    if len(matches) < 6:
-        fi.R = last.R.copy(); fi.t = last.t.copy(); return
-
-    # Use last frame's 2D→3D projection to get correspondences
-    P_last = fi.K @ np.hstack([last.R, last.t.reshape(3,1)])
-    pts2d  = np.float32([fi.kp[m.trainIdx].pt for m in matches])
-    # Approximate 3D from last frame depth
-    pts3d_approx = []
-    for m in matches:
-        u, v  = last.kp[m.queryIdx].pt
-        depth = 0.5   # unit depth approximation
-        X = (u - fi.K[0,2]) / fi.K[0,0] * depth
-        Y = (v - fi.K[1,2]) / fi.K[1,1] * depth
-        pts3d_approx.append([X, Y, depth])
-    pts3d_approx = np.float32(pts3d_approx)
-
-    success, rvec, tvec, _ = cv2.solvePnPRansac(
-        pts3d_approx, pts2d, fi.K, None,
-        flags=cv2.SOLVEPNP_ITERATIVE)
-
-    if success:
-        R, _ = cv2.Rodrigues(rvec)
-        fi.R = R; fi.t = tvec.ravel()
-    else:
-        fi.R = last.R.copy(); fi.t = last.t.copy()
-
-
-def _triangulate_new(fi: CameraFrame, fj: CameraFrame,
-                      bf) -> Tuple[list, list]:
-    """Triangulate new points between frame i and j."""
-    if fi.R is None or fj.R is None:
-        return [], []
-    matches = _match(fj, fi, bf)
-    if len(matches) < 5:
-        return [], []
-    pj = np.float32([fj.kp[m.queryIdx].pt for m in matches])
-    pi = np.float32([fi.kp[m.trainIdx].pt for m in matches])
-    return _triangulate(fj, fi, pj, pi)
-
-
-def _triangulate(fa: CameraFrame, fb: CameraFrame,
-                  pa: np.ndarray, pb: np.ndarray
-                  ) -> Tuple[list, list]:
-    """Triangulate matched 2D points into 3D."""
-    if fa.R is None or fb.R is None or len(pa) < 4:
-        return [], []
-    Pa = fa.K @ np.hstack([fa.R, fa.t.reshape(3,1)])
-    Pb = fb.K @ np.hstack([fb.R, fb.t.reshape(3,1)])
-
-    pts4d = cv2.triangulatePoints(Pa, Pb, pa.T, pb.T)
-    pts3d = (pts4d[:3] / (pts4d[3:] + 1e-9)).T
-
-    # Filter: positive depth, not too far
-    z_a = (fa.R @ pts3d.T + fa.t.reshape(3,1))[2]
-    keep = (z_a > 0.01) & (z_a < 10.0) & np.all(np.isfinite(pts3d), axis=1)
-
-    pts_good = pts3d[keep].tolist()
-    # Sample colors from frame a
-    colors   = []
-    h, w     = fa.image.shape[:2]
-    for j, pt2 in enumerate(pa):
-        if not keep[j]: continue
-        u, v = int(np.clip(pt2[0],0,w-1)), int(np.clip(pt2[1],0,h-1))
-        colors.append(fa.image[v, u].tolist())
-
-    return pts_good, colors
-
-
-def _match(fa: CameraFrame, fb: CameraFrame,
-            bf, max_matches: int = 500) -> list:
-    """BFMatcher + Lowe's ratio test."""
-    if fa.des is None or fb.des is None or len(fa.des) < 2 or len(fb.des) < 2:
-        return []
-    try:
-        raw = bf.knnMatch(fa.des, fb.des, k=2)
-    except cv2.error:
-        return []
-    good = [m for m, n in raw if m.distance < 0.75 * n.distance]
-    return sorted(good, key=lambda m: m.distance)[:max_matches]
-
-
-# ── Dense patch matching ──────────────────────────────────────────────────────
-
-def _dense_patch_match(frames: List[CameraFrame]
-                        ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Semi-dense stereo between consecutive frame pairs.
-    Uses optical flow (Lucas-Kanade) to get many more correspondences.
-    """
-    all_pts: List[np.ndarray] = []
-    all_col: List[np.ndarray] = []
-
-    for i in range(min(len(frames)-1, 8)):   # limit to 8 pairs for speed
-        fa, fb = frames[i], frames[i+1]
-        if fa.R is None or fb.R is None:
-            continue
-
-        gray_a = cv2.cvtColor(fa.image, cv2.COLOR_RGB2GRAY)
-        gray_b = cv2.cvtColor(fb.image, cv2.COLOR_RGB2GRAY)
-
-        # Shi-Tomasi corners as seeds
-        corners = cv2.goodFeaturesToTrack(
-            gray_a, maxCorners=1500, qualityLevel=0.01, minDistance=5)
-        if corners is None or len(corners) < 4:
-            continue
-
-        # Track with Lucas-Kanade optical flow
-        pts_b, status, _ = cv2.calcOpticalFlowPyrLK(
-            gray_a, gray_b, corners,
-            None, winSize=(15,15), maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT, 30, 0.01))
-
-        if pts_b is None:
-            continue
-
-        good = status.ravel() == 1
-        pa   = corners[good].reshape(-1, 2)
-        pb   = pts_b[good].reshape(-1, 2)
-
-        if len(pa) < 4:
-            continue
-
-        # Triangulate
-        pts3d, colors = _triangulate(fa, fb, pa, pb)
-        if pts3d:
-            all_pts.extend(pts3d)
-            all_col.extend(colors)
-
-    if not all_pts:
-        return np.zeros((0,3), np.float32), np.zeros((0,3), np.uint8)
-
-    return (np.array(all_pts, np.float32),
-            np.array(all_col, np.uint8))
-
-
-# ── Post-processing ───────────────────────────────────────────────────────────
-
-def _clean(pts: np.ndarray, colors: np.ndarray,
-            voxel: float = 0.004) -> Tuple[np.ndarray, np.ndarray]:
-    """Statistical outlier removal + voxel downsample."""
-    import open3d as o3d
-
-    if len(pts) == 0:
-        return pts, colors
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pts)
-    if len(colors) == len(pts):
-        pcd.colors = o3d.utility.Vector3dVector(
-            colors.astype(np.float64) / 255.0)
-
-    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=15, std_ratio=2.5)
-    pcd    = pcd.voxel_down_sample(voxel)
-    pcd.estimate_normals()
-
-    pts_out = np.asarray(pcd.points, np.float32)
-    col_out = (np.asarray(pcd.colors) * 255).astype(np.uint8) \
-              if pcd.has_colors() else np.zeros((len(pts_out),3), np.uint8)
-
-    log.info(f"After clean: {len(pts_out):,} points")
-    return pts_out, col_out
-
-
-# ── Coverage analysis ─────────────────────────────────────────────────────────
-
-def _analyse_coverage(frames: List[CameraFrame],
-                       pts3d: np.ndarray
-                       ) -> Tuple[Dict[str, float], List[float], List[str]]:
-    """
-    Analyse which camera angles have been captured and what's missing.
-
-    Returns
-    -------
-    coverage      : {angular, elevation, n_frames} ∈ [0,1]
-    angles_seen   : list of azimuth angles (degrees)
-    needs_angles  : human-readable list of missing angles
-    """
-    # Estimate object centroid
-    centroid = pts3d.mean(axis=0) if len(pts3d) > 0 else np.zeros(3)
-
-    # Compute azimuth of each camera around object centroid
-    azimuths   = []
-    elevations = []
-    for f in frames:
-        if f.R is None or f.t is None:
-            continue
-        # Camera position in world = -R^T t
-        cam_pos = -f.R.T @ f.t
-        diff    = cam_pos - centroid
-        azimuth   = float(np.degrees(np.arctan2(diff[0], diff[2])) % 360)
-        elevation = float(np.degrees(np.arctan2(diff[1],
-                          np.linalg.norm(diff[[0,2]]) + 1e-9)))
-        azimuths.append(azimuth)
-        elevations.append(elevation)
-
-    # Angular coverage: how much of 0-360 is within 30° of a captured angle
-    if azimuths:
-        covered_deg = 0
-        for test in range(0, 360, 5):
-            if any(abs(((test - a + 180) % 360) - 180) < 25
-                   for a in azimuths):
-                covered_deg += 5
-        angular_cov = min(1.0, covered_deg / 360)
-    else:
-        angular_cov = 0.0
-
-    # Elevation coverage: have we seen from above?
-    elev_cov = min(1.0, sum(1 for e in elevations if e > 20) / 3)
-
-    coverage = {
-        "angular":   angular_cov,
-        "elevation": elev_cov,
-        "n_frames":  min(1.0, len(frames) / 12),
-    }
-
-    # Build missing-angle prompts
-    needs = []
-    SECTORS = [
-        (0,   60,  "the front"),
-        (60,  120, "the right side"),
-        (120, 180, "the back-right"),
-        (180, 240, "the back"),
-        (240, 300, "the left side"),
-        (300, 360, "the front-left"),
-    ]
-    for lo, hi, label in SECTORS:
-        covered = any(lo <= a < hi for a in azimuths)
-        if not covered:
-            needs.append(f"from {label} ({lo}°–{hi}°)")
-
-    if elev_cov < 0.5:
-        needs.append("from above (top-down view)")
-
-    if len(frames) < 6:
-        needs.insert(0, f"{6 - len(frames)} more frames from any angle")
-
-    return coverage, azimuths, needs
-
-
-# ── Incremental reconstruction (called as frames arrive) ─────────────────────
-
-class IncrementalReconstructor:
-    """
-    Maintains state between frame uploads.
-    Called after each batch of new frames from the phone.
-    Returns updated point cloud + guidance for next capture.
-    """
-
-    def __init__(self):
-        self.frames:    List[CameraFrame] = []
-        self.result:    Optional[ReconstructionResult] = None
-        self._sift      = cv2.SIFT_create(nfeatures=4000, contrastThreshold=0.03)
-        self._bf        = cv2.BFMatcher(cv2.NORM_L2)
-
-    def add_frame(self, img: np.ndarray) -> Dict:
-        """
-        Add one frame, update reconstruction, return guidance dict.
-        """
-        h, w = img.shape[:2]
-        if h > 960:
-            scale = 960 / h
-            img   = cv2.resize(img, (int(w*scale), 960))
-
-        fx = max(img.shape[1], img.shape[0]) * 0.90
-        K  = np.array([[fx,0,img.shape[1]/2],
-                       [0,fx,img.shape[0]/2],[0,0,1]], np.float64)
-        cf      = CameraFrame(idx=len(self.frames), image=img, K=K)
-        gray    = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        cf.kp, cf.des = self._sift.detectAndCompute(gray, None)
-        self.frames.append(cf)
-
-        # Need at least 2 frames for reconstruction
-        if len(self.frames) < 2:
-            return {
-                "n_frames":     1,
-                "n_points":     0,
-                "coverage":     {"angular": 0.0, "elevation": 0.0},
-                "needs_angles": ["more frames — keep walking around the robot"],
-                "ready":        False,
-                "guidance":     "Walk slowly around the robot, capturing every step.",
-                "confidence":   0.0,
-            }
-
-        # Reconstruct with all frames so far
-        try:
-            self.result = reconstruct_from_frames(
-                [f.image for f in self.frames])
-        except Exception as e:
-            log.warning(f"Reconstruction error: {e}")
-            return self._guidance(0, [], ["reconstruction failed — keep capturing"])
-
-        return self._guidance(
-            len(self.result.points),
-            self.result.coverage,
-            self.result.needs_angles,
-        )
-
-    def _guidance(self, n_pts: int, coverage: dict,
-                   needs: list) -> dict:
-        ang = coverage.get("angular",   0.0) if coverage else 0.0
-        elv = coverage.get("elevation", 0.0) if coverage else 0.0
-        n   = coverage.get("n_frames",  0.0) if coverage else 0.0
-
-        overall = (ang * 0.5 + elv * 0.2 + n * 0.3)
-        ready   = overall >= 0.75 and n_pts >= 500
-
-        if needs:
-            msg = f"📸  Please capture {needs[0]}"
-        elif ready:
-            msg = "✅  Coverage complete — processing your robot now!"
+def _guidance(coverage: float, hits: np.ndarray) -> str:
+    missing = [i for i in range(12) if hits[i] == 0]
+    if coverage >= 1.0:
+        return "✅ Full coverage! Processing…"
+    if coverage >= 0.75:
+        return f"✅ {coverage:.0%} covered — tap 'Build Model' or keep going."
+    if not missing:
+        return f"📸 Keep capturing — {coverage:.0%} covered"
+
+    # Longest contiguous missing run
+    best_start, best_len, run_s, run_l = missing[0], 1, missing[0], 1
+    for k in range(1, len(missing)):
+        if missing[k] == missing[k-1]+1:
+            run_l += 1
+            if run_l > best_len:
+                best_len, best_start = run_l, run_s
         else:
-            msg = "Keep walking around the robot slowly."
-
-        return {
-            "n_frames":   len(self.frames),
-            "n_points":   n_pts,
-            "coverage":   coverage or {},
-            "needs_angles": needs,
-            "ready":      ready,
-            "guidance":   msg,
-            "confidence": round(overall, 2),
-        }
-
-    def get_pcd(self):
-        """Return open3d point cloud of current reconstruction."""
-        if self.result is None or len(self.result.points) == 0:
-            return None
-        return to_open3d_pcd(self.result)
+            run_s, run_l = missing[k], 1
+    gap_center = (best_start + best_len//2) * 30
+    dirs = ["front","front-right","right","right","right-back","back-right",
+            "back","back-left","left","left","front-left","front-left"]
+    direction = dirs[(gap_center//30) % 12]
+    return f"📸 Move to the {direction} side (~{gap_center}°) — {coverage:.0%} covered"
