@@ -1,6 +1,6 @@
 """TwinForge 3D — FastAPI server (HTTP + WebSocket)."""
 from __future__ import annotations
-import asyncio, json, logging, uuid
+import asyncio, json, logging, os, uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict
@@ -20,10 +20,14 @@ JOBS_DIR.mkdir(exist_ok=True)
 
 _jobs:    Dict[str, dict]   = {}
 _ws:      Dict[str, list]   = {}
-_reconst: Dict[str, object] = {}
+_live:    Dict[str, Dict[int, object]] = {}
 _executor = ThreadPoolExecutor(max_workers=2)
 _loop     = None
+PROJECT_ROOT = Path(__file__).parent.parent
 
+import sys; sys.path.insert(0, str(PROJECT_ROOT))
+from core.live import ModelHost
+_host = ModelHost()
 app = FastAPI(title="TwinForge 3D")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -31,6 +35,9 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 async def _startup():
     global _loop
     _loop = asyncio.get_event_loop()
+    import sys; sys.path.insert(0, str(PROJECT_ROOT))
+    if _backend_choice() == "vggt":
+        _host.start()          # background download/load; the phone page shows its progress
 
 @app.get("/", response_class=HTMLResponse)
 async def pwa(): return FileResponse(STATIC_DIR / "index.html")
@@ -38,77 +45,97 @@ async def pwa(): return FileResponse(STATIC_DIR / "index.html")
 @app.get("/viewer/{job_id}", response_class=HTMLResponse)
 async def viewer(job_id: str): return FileResponse(STATIC_DIR / "viewer.html")
 
+@app.get("/live/{job_id}", response_class=HTMLResponse)
+async def live_viewer(job_id: str): return FileResponse(STATIC_DIR / "viewer.html")
+
+@app.get("/live", response_class=HTMLResponse)
+async def live_latest(): return FileResponse(STATIC_DIR / "viewer.html")
+
+@app.get("/jobs/latest")
+async def latest_job():
+    return {"job_id": next(reversed(_jobs), None)}
+
+@app.get("/system")
+async def system():
+    """What the server is using; the phone page polls this before the first capture."""
+    return {"backend": _backend_choice(), "model": _host.state if _backend_choice() == "vggt"
+            else {"state": "ready", "msg": "CPU incremental SfM (no model download)", "pct": 100}}
+
 @app.post("/jobs/create")
 async def create_job():
     jid = str(uuid.uuid4())[:8]
-    (JOBS_DIR / jid / "input_frames").mkdir(parents=True)
+    (JOBS_DIR / jid / "scans").mkdir(parents=True)
     _jobs[jid]    = {"status":"waiting","pct":0,"msg":"Ready","n_frames":0,
                       "guidance":"Point camera at robot and tap Capture",
-                      "coverage":0.0,"ready":False}
+                      "coverage":0.0,"progress":0,"ready":False}
     _ws[jid]      = []
-    _reconst[jid] = None
+    _live[jid]    = {}
+    log.warning("New scan job %s - live 3D view: /live/%s  (or just open /live)", jid, jid)
+    print(f"\n>>> New scan job {jid}. Live 3D view: open /live on this PC (or /live/{jid})\n", flush=True)
     return {"job_id": jid}
 
+def _backend_choice() -> str:
+    import sys; sys.path.insert(0, str(PROJECT_ROOT))
+    want = os.environ.get("TWINFORGE_BACKEND", "auto").lower()
+    from core.live import ModelHost
+    if want == "sfm":
+        return "sfm"
+    if want in ("vggt", "auto") and ModelHost.available():
+        return "vggt"
+    return "sfm"
+
+def _get_live(jid: str, scan: int):
+    from core.live import LiveScan, SfMEngine, VGGTEngine
+    scans = _live.setdefault(jid, {})
+    if scan not in scans:
+        d = JOBS_DIR / jid / "scans" / f"scan_{scan:02d}"
+        eng = VGGTEngine(d, _host) if _backend_choice() == "vggt" else SfMEngine(d)
+        if _backend_choice() == "vggt":
+            _host.start()
+        def on_update(state, jid=jid, scan=scan):
+            st = dict(state, scan=scan)
+            _jobs[jid].update({k: v for k, v in st.items() if k != "type"})
+            if _loop:
+                asyncio.run_coroutine_threadsafe(_broadcast(jid, st), _loop)
+        scans[scan] = LiveScan(d, eng, on_update, label=f"scan {scan}")
+    return scans[scan]
+
 @app.post("/jobs/{jid}/frame")
-async def upload_frame(jid: str, file: UploadFile = File(...), scan: int = None):
+async def upload_frame(jid: str, file: UploadFile = File(...), scan: int = 0):
+    """Accept one photo and return immediately; the live worker thread does the reconstruction."""
     if jid not in _jobs:
         return JSONResponse({"error":"unknown job"}, status_code=404)
-
+    if not 0 <= scan <= 32:
+        return JSONResponse({"error": "scan index out of range"}, status_code=400)
     data = await file.read()
+    try:
+        ls = _get_live(jid, scan)
+    except Exception as e:
+        log.exception("live init failed")
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
+    ls.submit(data)
+    return ls.state
 
-    if scan is not None:
-        # Multi-scan capture: scan 0 = rest pose, scan i = only joint i moved.  Photos are stored per
-        # scan and reconstructed together when /run is called with {"articulated": true}.
-        if not 0 <= scan <= 32:
-            return JSONResponse({"error": "scan index out of range"}, status_code=400)
-        d = JOBS_DIR / jid / "scans" / f"scan_{scan:02d}"
-        d.mkdir(parents=True, exist_ok=True)
-        (d / f"frame_{len(list(d.glob('*.jpg'))):04d}.jpg").write_bytes(data)
-        counts = {p.name: len(list(p.glob("*.jpg"))) for p in sorted((JOBS_DIR / jid / "scans").iterdir())}
-        _jobs[jid]["scan_counts"] = counts
-        return {"scan": scan, "scan_counts": counts}
+@app.get("/jobs/{jid}/preview")
+async def preview(jid: str, scan: int = 0):
+    """Binary live model: uint32 n | float32 xyz[n*3] | uint8 rgb[n*3], display frame (y up, ~1 unit)."""
+    from fastapi.responses import Response
+    ls = _live.get(jid, {}).get(scan)
+    if not ls:
+        return Response(b"", media_type="application/octet-stream")
+    return Response(ls.preview_bytes(), media_type="application/octet-stream",
+                    headers={"Cache-Control": "no-store"})
 
-    # Save raw frame to disk
-    n    = _jobs[jid]["n_frames"]
-    dest = JOBS_DIR / jid / "input_frames" / f"frame_{n:04d}.jpg"
-    dest.write_bytes(data)
-    _jobs[jid]["n_frames"] += 1
-
-    # Lazy-init reconstructor
-    if _reconst[jid] is None:
-        try:
-            import sys; sys.path.insert(0, str(Path(__file__).parent.parent))
-            from core.reconstruction import IncrementalReconstructor
-            _reconst[jid] = IncrementalReconstructor(JOBS_DIR / jid)
-        except Exception as e:
-            log.warning(f"Reconstructor init failed: {e}")
-
-    guidance_dict = {
-        "n_frames": _jobs[jid]["n_frames"],
-        "guidance": "Analysing…",
-        "coverage": 0.0,
-        "covered_sectors": [],
-        "ready": False,
-    }
-
-    if _reconst[jid]:
-        try:
-            loop   = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                _executor, _reconst[jid].add_frame, data)
-            guidance_dict = {
-                "n_frames":       _jobs[jid]["n_frames"],
-                "guidance":       result.guidance,
-                "coverage":       result.coverage,
-                "covered_sectors":result.covered_sectors,
-                "ready":          result.coverage >= 0.75,
-            }
-        except Exception as e:
-            log.warning(f"Incremental recon error: {e}")
-
-    _jobs[jid].update(guidance_dict)
-    await _broadcast(jid, {"type": "frame_update", **guidance_dict})
-    return guidance_dict
+@app.post("/jobs/{jid}/joints/{joint_id}")
+async def edit_joint_ep(jid: str, joint_id: str, body: dict):
+    """Post-scan correction: change a joint's type/axis/limits/pivot without rescanning."""
+    from core.edit import edit_joint
+    try:
+        mj = edit_joint(JOBS_DIR / jid, joint_id, **{k: body[k] for k in
+                        ("type", "axis", "flip", "limit_lower", "limit_upper", "pivot_shift") if k in body})
+    except (KeyError, ValueError, StopIteration) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return mj
 
 @app.post("/jobs/{jid}/run")
 async def run_job(jid: str, body: dict = None):
@@ -123,7 +150,7 @@ async def run_job(jid: str, body: dict = None):
             _executor, _run_articulated_sync, jid, robot_name, (body or {}).get("size_m"))
         return {"status": "running", "job_id": jid, "mode": "articulated"}
     asyncio.get_event_loop().run_in_executor(
-        _executor, _run_sync, jid, robot_name)
+        _executor, _run_sync, jid, robot_name, (body or {}).get("size_m"))
     return {"status": "running", "job_id": jid}
 
 @app.get("/jobs/{jid}/status")
@@ -208,7 +235,7 @@ def _prog(jid, pct, stage, msg):
             _broadcast(jid, {"type":"progress","pct":pct,"stage":stage,"msg":msg}),
             _loop)
 
-def _run_sync(jid: str, robot_name: str):
+def _run_sync(jid: str, robot_name: str, size_m=None):
     import sys
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -221,40 +248,31 @@ def _run_sync(jid: str, robot_name: str):
     from core.visualizer     import save_frames
 
     jdir = JOBS_DIR / jid
-    inp  = jdir / "input_frames"
 
     try:
         _prog(jid, 5, "loading", "Loading captured frames…")
 
         scan = None
-        saved_imgs = sorted(inp.glob("*.jpg"))
-
-        # Use phone reconstruction if enough frames were captured
-        if len(saved_imgs) >= 4 and _reconst.get(jid):
-            try:
-                import open3d as o3d
-                _prog(jid, 10, "reconstruction", "Running SfM reconstruction…")
-                pcd = _reconst[jid].get_pcd()
-                if len(pcd.points) >= 500:
-                    log.info(f"Using phone reconstruction: {len(pcd.points):,} points")
-                    _prog(jid, 20, "reconstruction",
-                          f"Reconstructed {len(pcd.points):,} points")
-                    scan = _make_scan_from_pcd(pcd)
-            except Exception as e:
-                log.warning(f"Phone reconstruction failed: {e}")
-
+        fdir = jdir / "scans" / "scan_00" / "frames"
+        saved_imgs = sorted(fdir.glob("*.jpg")) if fdir.exists() else []
+        if len(saved_imgs) >= 6:
+            # Final model: the heavier offline SfM + dense stereo + TSDF pipeline over every saved photo.
+            import open3d as o3d
+            from core.articulated import load_mesh
+            _prog(jid, 10, "reconstruction", f"Dense reconstruction from {len(saved_imgs)} photos (several minutes on CPU)...")
+            work = jdir / "work"; work.mkdir(exist_ok=True)
+            mesh = load_mesh(fdir, work, size_m=size_m)
+            pcd = o3d.geometry.PointCloud(mesh.vertices)
+            if mesh.has_vertex_colors():
+                pcd.colors = mesh.vertex_colors
+            mesh.compute_vertex_normals(); pcd.normals = mesh.vertex_normals
+            if len(pcd.points) >= 500:
+                _prog(jid, 20, "reconstruction", f"Reconstructed {len(pcd.points):,} points")
+                scan = _make_scan_from_pcd(pcd)
         if scan is None:
             if len(saved_imgs) > 0:
-                # Never silently swap in the demo arm for a user's own scan.
-                try:
-                    n_pts = len(_reconst[jid].get_pcd().points) if _reconst.get(jid) else 0
-                except Exception:
-                    n_pts = 0
-                backend = getattr(getattr(_reconst.get(jid), "_impl", None), "__class__", type(None)).__name__
                 raise RuntimeError(
-                    f"Reconstruction produced only {n_pts} points from {len(saved_imgs)} photos "
-                    f"({backend}) - not enough to build a model. Capture more overlapping views "
-                    f"all around the robot, or install VGGT/DUSt3R for dense reconstruction.")
+                    f"Only {len(saved_imgs)} photos - capture at least 6 overlapping views all around the robot.")
             _prog(jid, 15, "loading", "No photos uploaded - using the built-in demo arm")
             scan = load(demo=True)
 
@@ -293,6 +311,7 @@ def _run_sync(jid: str, robot_name: str):
                 })
 
         meta = {
+            "mode": "single_scan_heuristic",
             "job_id":    jid,
             "robot_name": robot_name,
             "urdf_url":  f"/jobs/{jid}/urdf",
@@ -343,18 +362,19 @@ def _run_articulated_sync(jid: str, robot_name: str, size_m=None):
         if len(dirs) < 3:
             raise RuntimeError("Need the rest scan (scan 0) plus at least two joint scans (scan 1, 2, ...)")
         for d in dirs:
-            if len(list(d.glob("*.jpg"))) < 25:
-                raise RuntimeError(f"{d.name} has only {len(list(d.glob('*.jpg')))} photos; capture 50-80 around the robot")
+            if len(list((d / "frames").glob("*.jpg"))) < 20:
+                raise RuntimeError(f"{d.name} has only {len(list((d / 'frames').glob('*.jpg')))} photos; capture 40-80 around the robot")
         work = jdir / "work"; work.mkdir(exist_ok=True)
         meshes = []
         for k, d in enumerate(dirs):
             _prog(jid, 5 + int(60 * k / len(dirs)), "reconstruction", f"Reconstructing {d.name} ({k + 1}/{len(dirs)})...")
-            meshes.append(load_mesh(d, work, size_m=size_m if k == 0 else None))
+            meshes.append(load_mesh(d / "frames", work / d.name, size_m=size_m if k == 0 else None))
         _prog(jid, 70, "joints", "Detecting links and joints from the motion between scans...")
         comps, joints, res = build_from_scans(meshes[0], meshes[1:])
         _prog(jid, 85, "urdf", "Generating URDF + STL meshes...")
         urdf_path = build(comps, joints, robot_name, jdir)
         meta = {
+            "mode": "joint_scans",
             "job_id": jid, "robot_name": robot_name, "urdf_url": f"/jobs/{jid}/urdf",
             "n_links": len(comps), "n_joints": len(joints), "n_frames": 0,
             "links": [{"id": c.id, "label": c.label, "mesh_url": f"/jobs/{jid}/meshes/{c.id}.stl"}

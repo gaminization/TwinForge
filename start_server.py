@@ -96,6 +96,8 @@ def print_qr(url: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8443)
+    parser.add_argument("--backend", choices=["auto", "vggt", "sfm"], default="auto",
+                        help="live reconstruction engine: vggt (GPU, dense), sfm (CPU, sparse), auto")
     parser.add_argument("--http", action="store_true",
                         help="HTTP only (camera won't work on phone)")
     args = parser.parse_args()
@@ -142,12 +144,13 @@ def main():
     print("-" * 60)
     print_qr(net_url)
     print("-" * 60)
-    print(f"  3D Viewer (PC): {scheme}://localhost:{port}/viewer/demo")
+    print(f"  3D Viewer (PC): {scheme}://localhost:{port}/viewer/demo   (live view opens automatically per scan: /live/<job>)")
     print()
     print("  Press Ctrl+C to stop")
     print("=" * 60)
     print()
 
+    os.environ["TWINFORGE_BACKEND"] = args.backend
     from server.app import run_server
     run_server(host="0.0.0.0", port=port,
                ssl_keyfile=ssl_key, ssl_certfile=ssl_cert)

@@ -327,6 +327,14 @@ h1 { font-size: 28px; font-weight: 800; letter-spacing: -0.5px;
 
     <!-- Guidance pill -->
     <div id="guide-pill">Point camera at your robot</div>
+    <div id="hud-stats" style="position:absolute;top:96px;left:12px;font-size:11px;color:#fff;background:rgba(0,0,0,.45);border-radius:8px;padding:6px 8px;line-height:1.5"></div>
+    <div id="scan-lbl" style="position:absolute;top:96px;right:12px;font-size:11px;color:#fff;background:rgba(0,0,0,.45);border-radius:8px;padding:6px 8px;text-align:right"></div>
+    <div style="position:absolute;bottom:130px;left:0;right:0;display:flex;gap:8px;justify-content:center">
+      <button class="toggle-btn" onclick="toggleLive()">👁 Live 3D</button>
+      <button class="toggle-btn" id="next-scan-btn" onclick="nextScan()">+ Joint scan</button>
+      <button class="toggle-btn" id="finish-btn" onclick="startProcessing()">Finish</button>
+    </div>
+    <iframe id="live-frame" style="display:none;position:absolute;inset:0;width:100%;height:calc(100% - 150px);border:0;background:#08080f;z-index:5"></iframe>
 
     <!-- Flash -->
     <div class="flash" id="flash"></div>
@@ -467,7 +475,7 @@ async function testConn() {
 
 // ── Camera ────────────────────────────────────────────────────────────────────
 async function startScan() {
-  nFrames = 0;
+  nFrames = 0; curScan = 0; articulated = false; scanLabel();
   updateRing(0);
   updateGuide('Point camera at your robot', false, false);
   show('sc-cam');
@@ -491,7 +499,7 @@ async function startScan() {
   try {
     const r = await fetch(`${srv}/jobs/create`, { method: 'POST' });
     jobId = (await r.json()).job_id;
-    openWS();
+    openWS(); pollSystem();
   } catch {
     jobId = 'offline';
     toast('⚠️ Server offline — demo mode');
@@ -516,22 +524,44 @@ function updateGuide(msg, urgent, good) {
   el.classList.toggle('good',   good);
 }
 
+let curScan = 0, lastState = null;
+// Server state -> UI.  `progress` is REAL: 60% orbit coverage of the reconstructed cameras + 40% registered views.
 function applyGuidance(g) {
-  const conf = Math.round((g.confidence || 0) * 100);
-  updateRing(conf);
-
-  const need = g.needs_angles && g.needs_angles[0];
-  const tip  = need ? `Next: ${need}` : (conf >= 75 ? 'Great coverage!' : '');
-  document.getElementById('tip-left').innerHTML = tip.replace(': ', ':<br>');
-  updateGuide(g.guidance || 'Keep scanning…', conf < 35, conf >= 75);
-
-  if (g.ready && nFrames >= 6) {
-    if (autoMode) stopAuto();
-    setTimeout(startProcessing, 600);
-  }
+  if (!g || g.error && g.progress === undefined) { if (g && g.error) toast('Server: ' + g.error, 4000); return; }
+  if (g.scan !== undefined && g.scan !== curScan) return;
+  lastState = g;
+  updateRing(g.progress || 0);
+  updateGuide(g.guidance || 'Keep scanning…', !!g.lost || !!g.error, !!g.ready);
+  document.getElementById('frame-badge').textContent = `${g.n_frames} sent · ${g.n_registered} in model`;
+  document.getElementById('hud-stats').innerHTML =
+    `${(g.n_points || 0).toLocaleString()} points<br>${Math.round((g.coverage || 0) * 12)}/12 directions` +
+    (g.queue ? `<br>${g.queue} waiting` : '');
+  document.getElementById('tip-left').innerHTML = g.ready ? 'Ready!<br>Tap Finish' : '';
+  document.getElementById('finish-btn').style.outline = g.ready ? '2px solid #00d68f' : 'none';
+  if (g.ready && autoMode && g.progress >= 95) { stopAuto(); toast('Full coverage — tap Finish', 3000); }
 }
 
+function scanLabel() {
+  document.getElementById('scan-lbl').innerHTML =
+    curScan === 0 ? 'Scan 0: REST pose<br>(robot untouched)' : `Scan ${curScan}: move ONE joint<br>~40° then circle again`;
+}
+async function nextScan() {
+  if (lastState && lastState.n_registered < 8 && !confirm('This scan only has ' + lastState.n_registered + ' views in the model. Continue anyway?')) return;
+  curScan++; lastState = null; articulated = true;
+  updateRing(0); updateGuide('Now rotate ONE joint of the robot ~40°, keep the rest still, and circle again', false, false);
+  scanLabel(); toast('Scan ' + curScan + ': move a single joint');
+  document.getElementById('live-frame').style.display === 'block' && toggleLive(true);
+}
+function toggleLive(force) {
+  const f = document.getElementById('live-frame');
+  const show = force !== undefined ? force : f.style.display === 'none';
+  if (show) { f.src = `${srv}/live/${jobId}?scan=${curScan}`; f.style.display = 'block'; }
+  else      { f.style.display = 'none'; f.src = 'about:blank'; }
+}
+let articulated = false;
+
 // ── Capture ───────────────────────────────────────────────────────────────────
+let inflight = 0;
 async function captureFrame() {
   const video = document.getElementById('video');
   const cvs   = document.getElementById('cvs');
@@ -539,22 +569,22 @@ async function captureFrame() {
   cvs.height  = video.videoHeight || 480;
   cvs.getContext('2d').drawImage(video, 0, 0);
 
-  // Flash
   const fl = document.getElementById('flash');
   fl.classList.add('pop');
   setTimeout(() => fl.classList.remove('pop'), 100);
+  if (inflight >= 3) return;          // the server queues work; don't pile up if the link is slow
 
   nFrames++;
-  document.getElementById('frame-badge').textContent = `${nFrames} frame${nFrames !== 1 ? 's' : ''}`;
-
   cvs.toBlob(async blob => {
     if (!jobId || jobId === 'offline') return;
+    inflight++;
     try {
       const fd = new FormData();
       fd.append('file', blob, 'frame.jpg');
-      const r = await fetch(`${srv}/jobs/${jobId}/frame`, { method: 'POST', body: fd });
+      const r = await fetch(`${srv}/jobs/${jobId}/frame?scan=${curScan}`, { method: 'POST', body: fd });
       applyGuidance(await r.json());
-    } catch { /* offline */ }
+    } catch (e) { toast('Upload failed: ' + e.message, 3000); }
+    finally { inflight--; }
   }, 'image/jpeg', 0.85);
 }
 
@@ -566,9 +596,9 @@ function startAutoCapture() {
   autoMode = true;
   document.getElementById('auto-btn').classList.add('on');
   document.getElementById('auto-btn').textContent = 'Stop';
-  document.getElementById('auto-lbl').textContent = 'every 2s';
+  document.getElementById('auto-lbl').textContent = 'every 1.2s';
   document.getElementById('shutter').classList.add('auto-on');
-  autoTimer = setInterval(captureFrame, 2000);
+  autoTimer = setInterval(captureFrame, 1200);
 }
 function stopAuto() {
   autoMode = false;
@@ -592,17 +622,28 @@ async function startProcessing() {
     await fetch(`${srv}/jobs/${jobId}/run`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ robot_name: 'scanned_robot' })
+      body: JSON.stringify({ robot_name: 'scanned_robot', articulated })
     });
   } catch { runOfflineDemo(); }
+}
+
+async function pollSystem() {
+  try {
+    const r = await (await fetch(`${srv}/system`)).json();
+    if (r.model && r.model.state !== 'ready' && !lastState) updateGuide(r.model.msg || 'Loading model…', false, false);
+    if (r.model && (r.model.state === 'loading' || r.model.state === 'idle')) setTimeout(pollSystem, 1500);
+    if (r.model && r.model.state === 'ready' && r.backend === 'vggt' && !lastState) updateGuide('VGGT ready - tap Capture', false, true);
+    if (r.model && r.model.state === 'error') updateGuide(r.model.msg, true, false);
+  } catch (e) {}
 }
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
 function openWS() {
   if (!jobId || jobId === 'offline') return;
   const url = srv.replace(/^http/, 'ws') + `/jobs/${jobId}/ws`;
-  wsConn = new WebSocket(url);
-  wsConn.onmessage = e => {
+  const ws = wsConn = new WebSocket(url);
+  ws.onclose = () => setTimeout(() => { if (wsConn === ws) openWS(); }, 1500);
+  ws.onmessage = e => {
     const d = JSON.parse(e.data);
     if (d.type === 'progress')      onProgress(d);
     if (d.type === 'complete')      onComplete(d);
