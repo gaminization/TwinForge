@@ -7,6 +7,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core import live
 
 
+def circle_cams(n, radius=1.0, step_deg=20.0, w=640, h=480, f=500.0):
+    """n cameras on a circle at height 0.3 looking at the origin, phone upright."""
+    cams = []
+    for k in range(n):
+        a = np.radians(k * step_deg)
+        C = np.array([radius * np.cos(a), 0.3, radius * np.sin(a)])
+        z = -C / np.linalg.norm(C)
+        yd = -(np.array([0, 1.0, 0]) - (np.array([0, 1.0, 0]) @ z) * z); yd /= np.linalg.norm(yd)
+        x = np.cross(yd, z)
+        R = np.stack([x, yd, z])
+        cams.append({"R": R, "t": -R @ C, "K": np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1.0]]), "wh": (w, h)})
+    return cams
+
+
+def scene_points():
+    """robot (blob of 0.4 x 0.4 x 0.5 on the table) + table slab + far wall."""
+    rng = np.random.default_rng(1)
+    robot = np.stack([rng.uniform(-.15, .15, 800), rng.uniform(0, .5, 800), rng.uniform(-.15, .15, 800)], 1)
+    table = np.stack([rng.uniform(-.6, .6, 3000), np.full(3000, -0.001) + rng.normal(0, .002, 3000),
+                      rng.uniform(-.6, .6, 3000)], 1)
+    wall = np.stack([rng.uniform(-3, 3, 2000), rng.uniform(-1, 2, 2000), np.full(2000, -3.0)], 1)
+    pts = np.vstack([robot, table, wall])
+    rgb = np.vstack([np.tile([30, 120, 255], (800, 1)), np.tile([90, 90, 90], (3000, 1)),
+                     np.tile([220, 200, 180], (2000, 1))]).astype(np.uint8)
+    return pts, rgb
+
+
 class FakeEngine:
     """Registers every photo, puts cameras on a circle, and is deliberately slow."""
     name = "fake"; lost = False; waiting_baseline = False
@@ -27,13 +54,8 @@ class FakeEngine:
             self.n += 1
 
     def snapshot(self):
-        rng = np.random.default_rng(0)
-        pts = rng.normal(size=(500, 3)) * 0.1
-        k = np.arange(self.n)
-        ang = np.radians(k * 20.0)
-        C = np.stack([np.cos(ang), np.zeros_like(ang), np.sin(ang)], 1)
-        Y = np.tile([0.0, 1.0, 0.0], (self.n, 1))       # camera "down" = +y  -> up = -y
-        return pts, np.full((500, 3), 128, np.uint8), C, Y
+        pts, rgb = scene_points()
+        return pts, rgb, circle_cams(self.n)
 
 
 def _run(tmp_path, engine, n):
@@ -60,7 +82,8 @@ def test_progress_is_real_and_monotone(tmp_path):
     p = [u["progress"] for u in ups]
     assert p == sorted(p) and p[0] == 0 and p[-1] >= 85
     assert ls.state["coverage"] >= 0.9 and ls.state["ready"]
-    assert (tmp_path / "preview.bin").stat().st_size == 4 + 500 * 15
+    n = np.frombuffer((tmp_path / "preview.bin").read_bytes()[:4], np.uint32)[0]
+    assert 400 <= n <= 800                      # robot kept; table + wall dropped
 
 
 def test_errors_are_surfaced_not_swallowed(tmp_path):
@@ -103,3 +126,19 @@ def test_edit_joint_keeps_geometry(tmp_path):
     assert j.get("type") == "fixed" and j.find("limit") is None
     with pytest.raises(KeyError):
         edit_joint(tmp_path, "nope")
+
+
+def test_foreground_keeps_robot_drops_wall_and_table():
+    from core.foreground import select_object
+    pts, rgb = scene_points()
+    m, info = select_object(pts, circle_cams(18), return_info=True)
+    robot, table, wall = m[:800], m[800:3800], m[3800:]
+    assert robot.mean() > 0.9, info             # the robot survives
+    assert table.mean() < 0.05, info            # the support plane is removed
+    assert wall.mean() == 0.0, info             # far background is removed
+
+
+def test_foreground_never_empties_the_model():
+    from core.foreground import select_object
+    pts = np.random.default_rng(0).normal(size=(40, 3))
+    assert select_object(pts, circle_cams(5)).all()      # too little data: keep everything

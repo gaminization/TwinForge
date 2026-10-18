@@ -148,16 +148,17 @@ class SfMEngine:
             self._add(p)
 
     def snapshot(self):
-        """points (N,3), colours (N,3) uint8, camera centres (M,3), camera down-axes (M,3), cam index list"""
+        """(points (N,3), colours (N,3) uint8, cams) - cams: list of dict(R, t, K, wh) for registered views"""
         if not self.map_xyz:
             return None
         xyz = np.asarray(self.map_xyz); rgb = np.asarray(self.map_rgb, dtype=np.uint8)
-        obs = np.asarray(self.map_obs)
-        keep = obs >= 2
-        poses = [self.frames[i].pose for i in self.reg]
-        C = np.array([-p[:, :3].T @ p[:, 3] for p in poses])
-        Y = np.array([p[:, :3].T[:, 1] for p in poses])
-        return xyz[keep], rgb[keep], C, Y
+        keep = np.asarray(self.map_obs) >= 2
+        cams = []
+        for i in self.reg:
+            f = self.frames[i]
+            h, w = f.rgb.shape[:2]
+            cams.append({"R": f.pose[:, :3], "t": f.pose[:, 3], "K": self.K, "wh": (w, h)})
+        return xyz[keep], rgb[keep], cams
 
     @property
     def n_registered(self) -> int:
@@ -356,6 +357,20 @@ class ModelHost:
             self._thread = threading.Thread(target=self._load, name="vggt-loader", daemon=True)
             self._thread.start()
 
+    def release(self) -> None:
+        """Free the model's GPU/CPU memory (the final build needs the RAM); it reloads lazily from the cache."""
+        with self._lock:
+            self.model = None
+            self._thread = None
+            self.state = {"state": "idle", "msg": "VGGT unloaded", "pct": 0}
+        try:
+            import gc, torch
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
     def _hf_pct(self) -> int:
         root = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
         d = root / "models--facebook--VGGT-1B"
@@ -452,10 +467,10 @@ class VGGTEngine:
         rgb = images.float().permute(0, 2, 3, 1).cpu().numpy()
         thr = np.quantile(conf, 1.0 - self.CONF_KEEP)
         mask = (conf >= thr) & (depth[..., 0] > 0) & np.isfinite(world).all(-1)
-        R, t = extri[:, :, :3], extri[:, :, 3]
-        C = -np.einsum("sij,sj->si", R.transpose(0, 2, 1), t)
-        Y = R[:, 1, :]                                  # camera image-down axis in world coordinates
-        self._snap = (world[mask], (np.clip(rgb[mask], 0, 1) * 255).astype(np.uint8), C, Y)
+        H, W = images.shape[-2:]
+        cams = [{"R": extri[i, :, :3], "t": extri[i, :, 3], "K": intri[i], "wh": (int(W), int(H))}
+                for i in range(len(extri))]
+        self._snap = (world[mask], (np.clip(rgb[mask], 0, 1) * 255).astype(np.uint8), cams)
         self._n_reg = len(self.paths)
 
     def snapshot(self):
@@ -503,8 +518,8 @@ class LiveScan:
         self._stop = True
         self.q.put(None)
 
-    def preview_bytes(self) -> bytes:
-        f = self.dir / "preview.bin"
+    def preview_bytes(self, background: bool = False) -> bytes:
+        f = self.dir / ("preview_bg.bin" if background else "preview.bin")
         return f.read_bytes() if f.exists() else b""
 
     # ---- worker ------------------------------------------------------------
@@ -538,7 +553,10 @@ class LiveScan:
                 self.n_processed += len(batch)
                 self.error = None
                 self._export_preview()
-                self.state["ms_per_batch"] = int(1000 * (time.time() - t))
+                self._ms = int(1000 * (time.time() - t))
+                log.info("%s: +%d photo(s) -> %d registered, %d object points, %d background points dropped (%d ms)",
+                         self.label, len(batch), self.engine.n_registered,
+                         getattr(self, "_n_points", 0), getattr(self, "_n_bg", 0), self._ms)
             except Exception as e:                           # never swallow: surface to the UI
                 self.error = f"{type(e).__name__}: {e}"
                 log.error("live reconstruction failed: %s\n%s", e, traceback.format_exc())
@@ -548,19 +566,29 @@ class LiveScan:
     def _export_preview(self):
         snap = self.engine.snapshot()
         if snap is None:
-            self._pts_d = None
             return
-        pts, rgb, C, Y = snap
-        if len(pts) == 0 or len(C) == 0:
+        pts, rgb, cams = snap
+        if len(pts) == 0 or len(cams) == 0:
             return
-        R, centre, scale = display_frame(pts, C, Y)
-        P = ((pts - centre) @ R.T) * scale
-        Cd = ((C - centre) @ R.T) * scale
-        keep = np.abs(P).max(1) < 3.0                     # drop far outliers (sky / bad depth)
-        P, rgb = P[keep], rgb[keep]
+        from core.foreground import select_object, _centres_axes
+        if len(pts) > 400_000:                           # dense engines: keep the scoring cheap
+            sel = np.random.default_rng(0).choice(len(pts), 400_000, replace=False)
+            pts, rgb = pts[sel], rgb[sel]
+        fg, info = select_object(pts, cams, return_info=True)
+        self.fg_info = info
+        C, _, Y = _centres_axes(cams)
+        R, centre, scale = display_frame(pts[fg], C, Y)  # frame fitted to the ROBOT, not the room
+        to_d = lambda X: ((X - centre) @ R.T) * scale
+        P, Pc = to_d(pts[fg]), rgb[fg]
+        Pb, Pbc = to_d(pts[~fg]), rgb[~fg]
+        Cd = to_d(C)
+        rng = np.random.default_rng(0)
         if len(P) > MAX_PREVIEW_POINTS:
-            sel = np.random.default_rng(0).choice(len(P), MAX_PREVIEW_POINTS, replace=False)
-            P, rgb = P[sel], rgb[sel]
+            sel = rng.choice(len(P), MAX_PREVIEW_POINTS, replace=False); P, Pc = P[sel], Pc[sel]
+        keepb = np.abs(Pb).max(1) < 4.0 if len(Pb) else np.zeros(0, bool)
+        Pb, Pbc = Pb[keepb], Pbc[keepb]
+        if len(Pb) > 20_000:
+            sel = rng.choice(len(Pb), 20_000, replace=False); Pb, Pbc = Pb[sel], Pbc[sel]
         cov = orbit_coverage(Cd)
         seen = getattr(self, "_seen", np.zeros(N_SECTORS, bool))
         seen = seen | (cov["hits"] > 0)           # a covered direction never becomes uncovered again
@@ -570,17 +598,16 @@ class LiveScan:
         self._cov = cov
         self._cams = Cd
         self._n_points = len(P)
-        buf = io.BytesIO()
-        buf.write(np.uint32(len(P)).tobytes())
-        buf.write(P.astype(np.float32).tobytes())
-        buf.write(rgb.astype(np.uint8).tobytes())
-        tmp = self.dir / "preview.tmp"
-        tmp.write_bytes(buf.getvalue())
-        tmp.replace(self.dir / "preview.bin")
+        self._n_bg = int((~fg).sum())
+
+        def pack(X, c):
+            return np.uint32(len(X)).tobytes() + X.astype(np.float32).tobytes() + c.astype(np.uint8).tobytes()
+        for name, buf in (("preview", pack(P, Pc)), ("preview_bg", pack(Pb, Pbc))):
+            tmp = self.dir / f"{name}.tmp"
+            tmp.write_bytes(buf); tmp.replace(self.dir / f"{name}.bin")
         self.version += 1
-        # keep the display transform so exported results can be mapped to the same frame
         (self.dir / "display_frame.json").write_text(json.dumps(
-            {"R": R.tolist(), "centre": centre.tolist(), "scale": scale}))
+            {"R": R.tolist(), "centre": centre.tolist(), "scale": scale, "foreground": info}, default=float))
 
     def _publish(self):
         eng = self.engine
@@ -613,6 +640,8 @@ class LiveScan:
             "n_registered": n_reg,
             "queue": self.q.qsize(),
             "n_points": getattr(self, "_n_points", 0),
+            "n_background_removed": getattr(self, "_n_bg", 0),
+            "ms_per_batch": getattr(self, "_ms", 0),
             "coverage": n_cov / N_SECTORS,
             "covered_sectors": [int(i) for i in np.flatnonzero(cov["hits"])] if cov else [],
             "high_view": bool(cov["high_view"]) if cov else False,

@@ -43,6 +43,19 @@ The progress ring is **real**: 60 % = how many of 12 orbit directions around the
 (a photo only counts if it was actually localised in the model), 40 % = registered views (target 24). It can only
 go up. Photos that fail to register do not count, and the guidance line says "Tracking lost" instead of pretending.
 
+### Only the robot, not the room
+
+Photogrammetry reconstructs everything in view (wall, monitor, desk, cables). `core/foreground.py` keeps the object
+you orbit, using only geometry (no colour or model assumptions): (1) *focus point* = least-squares intersection of
+all camera optical axes; (2) *centrality* - the robot stays near the image centre in most views, background does not;
+(3) *radius* - only points within ~0.7 x the camera distance of the focus point; (4) *support plane* - the table/floor
+shows up as a thin, very dense horizontal slab in the height histogram and is removed together with everything below
+it; (5) only the largest connected blob survives. The live page shows the count of removed points and a
+"show removed background" checkbox so you can see what was cut. The same selection seeds the final build (the
+GrabCut masks and visual-hull box now come from the robot's points only, not the whole room).
+It assumes you keep the robot roughly centred and orbit it; if you stand very close or scan only a short arc, check the
+checkbox to make sure nothing important was removed.
+
 ### Live engines
 
 * **`sfm` (CPU, always works, no download)** – real incremental Structure-from-Motion: SIFT features → match to the
@@ -71,17 +84,25 @@ git clone https://github.com/facebookresearch/vggt && pip install -e vggt
 Self-test (≈1 min): `pytest -p no:launch_testing -q tests`
 (`-p no:launch_testing` avoids a crash when a ROS install puts its `launch_testing` pytest plugin on your path.)
 
-## 3. Run it
+## 3. Run it - one command
 
 ```bash
-python3 start_server.py                 # HTTPS on :8443, prints a QR code. --backend sfm|vggt|auto  --port N
+python3 launch.py                # everything: setup check -> HTTPS cert -> server -> opens the live viewer -> phone QR
+python3 launch.py --check        # only check the setup (tells you the exact fix for anything missing)
+python3 launch.py --backend sfm  # force the CPU engine (skips the 5 GB VGGT download)
+python3 launch.py --demo         # no phone needed: build the built-in demo arm and open it in the viewer
+python3 launch.py --test         # run the test-suite
 ```
-1. Open the printed `https://<pc-ip>:8443` on the phone (same Wi-Fi). Accept the self-signed certificate warning
-   (*Advanced → Proceed*); the camera only works over HTTPS.
-2. On the PC open `https://localhost:8443/live` – it waits for the phone to start a scan and then follows the
-   newest job automatically (the job id is also printed in the server log; `/live/<job-id>` works directly, and the
-   phone's **👁 Live 3D** button shows the same page on the phone).
+`launch.py` replaces running things one by one: it checks Python/libraries/GPU/VGGT/COLMAP, generates the
+certificate, starts the server (VGGT weights load in the background), opens `https://localhost:8443/live` in your
+browser, and prints the phone URL + QR code (the browser page shows the same QR code until a phone connects).
+(`start_server.py` is the plain server without the checks/browser; both work.)
+
+1. **PC browser** opens on `/live` automatically. First time it warns about the self-signed certificate:
+   *Advanced → Proceed*. It shows a QR code and waits for the phone.
+2. **Phone** (same Wi-Fi): scan the QR / open the URL, accept the same certificate warning once (camera needs HTTPS).
 3. Tap **Start scan**, then **Capture** (or **Auto**: one photo every 1.2 s) while walking slowly around the robot.
+   The PC page switches to that scan by itself and the point cloud grows with every photo.
 4. When the ring is green and the pill says *Ready*, tap **Finish**. Or add joint scans (next section).
 
 ### How to photograph (this decides the quality)
@@ -148,9 +169,10 @@ in RViz / PyBullet / MuJoCo / Isaac), `meta.json`, `scans/scan_NN/frames/*.jpg` 
 ## 8. Project layout
 
 ```
-start_server.py        HTTPS server + QR          twinforge.py        CLI (demo / photos / scans)
+launch.py              ONE-COMMAND launcher (checks, server, browser) start_server.py  HTTPS server + QR         twinforge.py        CLI (demo / photos / scans)
 server/app.py          FastAPI, WebSocket          server/static/index.html   phone capture page
-core/live.py           live engines + worker       server/static/viewer.html  live view + result + joint audit
+core/live.py           live engines + worker       core/foreground.py  robot-only selection
+server/worker.py       final build in own process        server/static/viewer.html  live view + result + joint audit
 core/photo_recon.py    offline SfM+dense+TSDF      core/jointscan.py   joints from rest+joint scans
 core/articulated.py    scans → links/joints        core/edit.py        post-scan joint editing
 core/urdf_builder.py   URDF + STL writer           eval/               synthetic benchmarks (see eval/README.md)
@@ -160,7 +182,8 @@ core/urdf_builder.py   URDF + STL writer           eval/               synthetic
 
 | Symptom | Cause / fix |
 |---|---|
-| Ring stuck at 0 % (old versions) | fixed: UI read a field the server never sent, and the first photo blocked the server while VGGT downloaded |
+| Ring stuck at 0 % (old versions) | fixed: UI read a field the server never sent; the first photo blocked the server while VGGT downloaded; the phone only listened to a WebSocket and ignored the resync snapshot (it now polls `/status` too) |
+| Server prints `Killed` when you tap Finish | Out of memory (VGGT in GPU/RAM + COLMAP on a 16 GB machine). Now VGGT is unloaded before the final build and the build runs in a separate process: a crash is reported as an error instead of killing the server. Still too big? capture fewer photos (30-50) or close other programs |
 | "Downloading VGGT weights…" for minutes | first run only (~5 GB, cached in `~/.cache/huggingface`); photos queue meanwhile. Use `--backend sfm` to skip it |
 | "Move the phone sideways…" | need parallax: translate the phone ~10 cm between the first two shots |
 | "Tracking lost…" | shots too far apart / blur / blank surface: go back to the last good spot, shoot closer together |

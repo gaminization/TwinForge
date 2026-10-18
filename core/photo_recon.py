@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
+import os
 import cv2
 import numpy as np
 import open3d as o3d
@@ -60,8 +61,15 @@ def _run_sfm(image_dir: Path, work: Path):
         db.unlink()
     ro = pycolmap.ImageReaderOptions()
     ro.camera_model = "SIMPLE_RADIAL"
+    kw = {}
+    try:                       # bound RAM: COLMAP otherwise uses every core x full-size images
+        eo = pycolmap.FeatureExtractionOptions()
+        eo.max_image_size = 1600; eo.num_threads = max(2, (os.cpu_count() or 4) // 2)
+        kw["extraction_options"] = eo
+    except Exception:
+        pass
     pycolmap.extract_features(db, image_dir, camera_mode=pycolmap.CameraMode.SINGLE,
-                              reader_options=ro, device=pycolmap.Device.cpu)
+                              reader_options=ro, device=pycolmap.Device.cpu, **kw)
     pycolmap.match_exhaustive(db, device=pycolmap.Device.cpu)
     maps = pycolmap.incremental_mapping(db, image_dir, sparse_dir)
     if not maps:
@@ -366,10 +374,6 @@ def reconstruct_from_photos(image_dir, work_dir, size_m: Optional[float] = None,
                            "overlap. Take more photos with ~70% overlap between neighbours.")
 
     sparse_world = np.array([p.xyz for p in rec.points3D.values()])
-    # drop SfM outliers (far from the dense core)
-    med = np.median(sparse_world, 0)
-    dist = np.linalg.norm(sparse_world - med, axis=1)
-    core = sparse_world[dist < np.percentile(dist, 97)]
 
     # per-image camera data
     cams = []
@@ -379,6 +383,25 @@ def reconstruct_from_photos(image_dir, work_dir, size_m: Optional[float] = None,
         cam = rec.cameras[im.camera_id]
         M = im.cam_from_world().matrix()
         cams.append(dict(name=im.name, cam=cam, R=M[:, :3], t=M[:, 3]))
+
+    # The sparse cloud contains the whole ROOM.  The GrabCut seeds, visual-hull box and everything after
+    # must come from the ROBOT only: keep the object the cameras orbit (core/foreground.py).
+    from core.foreground import select_object
+    fcams = []
+    for c in cams:
+        pr = c["cam"].params
+        f = pr[0]; cx, cy = (pr[1], pr[2]) if len(pr) >= 3 else (c["cam"].width / 2, c["cam"].height / 2)
+        fy = pr[1] if str(c["cam"].model).endswith("PINHOLE") and len(pr) == 4 else f
+        K = np.array([[f, 0, cx], [0, fy, cy], [0, 0, 1.0]])
+        fcams.append(dict(R=c["R"], t=c["t"], K=K, wh=(c["cam"].width, c["cam"].height)))
+    obj_mask, finfo = select_object(sparse_world, fcams, return_info=True)
+    rep["foreground"] = {k: v for k, v in finfo.items() if k in ("method", "kept", "dropped")}
+    log.info("foreground selection: %s", rep["foreground"])
+    sparse_obj = sparse_world[obj_mask]
+    # drop SfM outliers (far from the dense core)
+    med = np.median(sparse_obj, 0)
+    dist = np.linalg.norm(sparse_obj - med, axis=1)
+    core = sparse_obj[dist < np.percentile(dist, 97)]
 
     prog(0.30, f"Segmenting the object in {len(cams)} photos …")
     masks, ims = [], []

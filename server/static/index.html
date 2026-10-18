@@ -637,6 +637,12 @@ async function pollSystem() {
   } catch (e) {}
 }
 
+// Fallback: the WebSocket can drop (phone sleep, Wi-Fi roaming). Poll the same state so the UI never freezes.
+setInterval(async () => {
+  if (!jobId || jobId === 'offline' || !document.getElementById('sc-cam').classList.contains('on')) return;
+  try { const g = await (await fetch(`${srv}/jobs/${jobId}/status`)).json(); if (g.progress !== undefined) applyGuidance(g); } catch (e) {}
+}, 1500);
+
 // ── WebSocket ─────────────────────────────────────────────────────────────────
 function openWS() {
   if (!jobId || jobId === 'offline') return;

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict
 import numpy as np
 
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 import uvicorn
 
@@ -54,6 +54,31 @@ async def live_latest(): return FileResponse(STATIC_DIR / "viewer.html")
 @app.get("/jobs/latest")
 async def latest_job():
     return {"job_id": next(reversed(_jobs), None)}
+
+def _lan_ip() -> str:
+    import socket
+    try:
+        so = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); so.connect(("8.8.8.8", 80))
+        ip = so.getsockname()[0]; so.close(); return ip
+    except Exception:
+        return "127.0.0.1"
+
+@app.get("/phone-url")
+async def phone_url(request: Request):
+    port = request.url.port or (443 if request.url.scheme == "https" else 80)
+    return {"url": f"{request.url.scheme}://{_lan_ip()}:{port}/"}
+
+@app.get("/qr.svg")
+async def qr_svg(u: str):
+    """QR code of `u` as SVG (shown on the PC live page so the phone can join without the terminal)."""
+    from fastapi.responses import Response
+    try:
+        import qrcode, qrcode.image.svg
+        img = qrcode.make(u, image_factory=qrcode.image.svg.SvgPathImage, border=1)
+        import io; b = io.BytesIO(); img.save(b)
+        return Response(b.getvalue(), media_type="image/svg+xml")
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 @app.get("/system")
 async def system():
@@ -117,13 +142,13 @@ async def upload_frame(jid: str, file: UploadFile = File(...), scan: int = 0):
     return ls.state
 
 @app.get("/jobs/{jid}/preview")
-async def preview(jid: str, scan: int = 0):
+async def preview(jid: str, scan: int = 0, bg: int = 0):
     """Binary live model: uint32 n | float32 xyz[n*3] | uint8 rgb[n*3], display frame (y up, ~1 unit)."""
     from fastapi.responses import Response
     ls = _live.get(jid, {}).get(scan)
     if not ls:
         return Response(b"", media_type="application/octet-stream")
-    return Response(ls.preview_bytes(), media_type="application/octet-stream",
+    return Response(ls.preview_bytes(bool(bg)), media_type="application/octet-stream",
                     headers={"Cache-Control": "no-store"})
 
 @app.post("/jobs/{jid}/joints/{joint_id}")
@@ -143,15 +168,17 @@ async def run_job(jid: str, body: dict = None):
         return JSONResponse({"error":"unknown job"}, status_code=404)
     if _jobs[jid]["status"] in ("running","done"):
         return {"status": _jobs[jid]["status"]}
-    robot_name = (body or {}).get("robot_name", "scanned_robot")
-    _jobs[jid]["status"] = "running"
-    if (body or {}).get("articulated"):
-        asyncio.get_event_loop().run_in_executor(
-            _executor, _run_articulated_sync, jid, robot_name, (body or {}).get("size_m"))
-        return {"status": "running", "job_id": jid, "mode": "articulated"}
+    body = body or {}
+    mode = "articulated" if body.get("articulated") else "single"
+    _jobs[jid].update({"status": "running", "pct": 1, "msg": "Starting final build..."})
+    # Free the GPU/RAM held by the live VGGT model: the final build is CPU/RAM heavy (COLMAP + dense
+    # stereo) and on a 16 GB laptop both together get the whole server OOM-killed.
+    for ls in _live.get(jid, {}).values():
+        ls.close()
+    _host.release()
     asyncio.get_event_loop().run_in_executor(
-        _executor, _run_sync, jid, robot_name, (body or {}).get("size_m"))
-    return {"status": "running", "job_id": jid}
+        _executor, _run_in_subprocess, jid, mode, body.get("robot_name", "scanned_robot"), body.get("size_m"))
+    return {"status": "running", "job_id": jid, "mode": mode}
 
 @app.get("/jobs/{jid}/status")
 async def get_status(jid: str):
@@ -164,7 +191,9 @@ async def ws_ep(ws: WebSocket, jid: str):
     await ws.accept()
     _ws.setdefault(jid, []).append(ws)
     if jid in _jobs:
-        await ws.send_json(_jobs[jid])
+        await ws.send_json({k: v for k, v in _jobs[jid].items() if k != "meta"})
+        for scan, ls in _live.get(jid, {}).items():          # late joiners get the CURRENT state at once
+            await ws.send_json(dict(ls.state, scan=scan))
     try:
         while True:
             await asyncio.sleep(1)
@@ -394,6 +423,38 @@ def _run_articulated_sync(jid: str, robot_name: str, size_m=None):
         _jobs[jid].update({"status": "error", "msg": str(e)})
         if _loop:
             asyncio.run_coroutine_threadsafe(_broadcast(jid, {"type": "error", "msg": str(e)}), _loop)
+
+
+def _run_in_subprocess(jid: str, mode: str, robot_name: str, size_m):
+    """Run the heavy final build in a separate process; relay its progress; survive its death."""
+    import subprocess, sys
+    cmd = [sys.executable, "-m", "server.worker", jid, mode, robot_name,
+           "none" if size_m in (None, "") else str(size_m)]
+    final = None
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), stdout=subprocess.PIPE, text=True, bufsize=1)
+        for line in proc.stdout:
+            if line.startswith("@@"):
+                msg = json.loads(line[2:])
+                if msg["t"] == "prog":
+                    _prog(jid, msg["pct"], msg["stage"], msg["msg"])
+                elif msg["t"] == "final":
+                    final = msg["job"]
+            else:
+                print(line, end="")
+        rc = proc.wait()
+    except Exception as e:
+        rc, final = -1, {"status": "error", "msg": f"could not start the build process: {e}"}
+    if final is None:
+        why = ("the build process was killed (almost certainly out of memory - close other programs, "
+               "capture fewer photos, or use --backend sfm)" if rc in (-9, 137) else f"the build process crashed (exit code {rc})")
+        final = {"status": "error", "msg": "Final build failed: " + why}
+    _jobs[jid].update(final)
+    if _loop:
+        if final.get("status") == "done":
+            asyncio.run_coroutine_threadsafe(_broadcast(jid, {"type": "complete", **final.get("meta", {})}), _loop)
+        else:
+            asyncio.run_coroutine_threadsafe(_broadcast(jid, {"type": "error", "msg": final.get("msg", "failed")}), _loop)
 
 
 def _make_scan_from_pcd(pcd):

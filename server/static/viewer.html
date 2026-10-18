@@ -101,6 +101,8 @@ canvas { width:100%!important; height:100%!important }
     <div class="grid">Views captured <span id="l-n">0</span> Registered in model <span id="l-reg">0</span>
       3D points <span id="l-pts">0</span> Orbit coverage <span id="l-cov">0/12</span>
       Engine <span id="l-eng">-</span> Queue <span id="l-q">0</span></div>
+    <div class="grid">Object points <span id="l-fg">0</span> Background removed <span id="l-bgn">0</span></div>
+    <label style="display:block;margin-top:6px;font-size:11px;color:#a0a0c0"><input type="checkbox" id="l-showbg" onchange="lastVer=-1"> show removed background (grey)</label>
     <div id="guide">Waiting for the first photo...</div><div id="msg"></div>
     <div class="row" style="margin-top:10px"><button class="btn active" onclick="finishScan()">Finish &amp; build URDF</button></div>
   </div>
@@ -268,7 +270,9 @@ const LINK_COLORS = [
 // ── Load robot from meta + STL files ─────────────────────────
 let jobId = location.pathname.split('/').pop();
 if (location.pathname.replace(/\/$/,'') === '/live') {          // /live = follow the newest scan job
-  document.getElementById('loading').innerHTML='<div class="spin"></div>Waiting for a phone to start a scan…';
+  document.getElementById('loading').style.pointerEvents='auto';
+  document.getElementById('loading').innerHTML='<div class="spin"></div><b>Waiting for a phone to start a scan…</b><br><br>Open this address on your phone (same Wi-Fi):<br><span id="pu" style="color:#00c8ff"></span><br><img id="qr" style="margin-top:10px;width:180px;background:#fff;padding:6px;border-radius:8px">';
+  fetch('/phone-url').then(r=>r.json()).then(d=>{document.getElementById('pu').textContent=d.url;document.getElementById('qr').src='/qr.svg?u='+encodeURIComponent(d.url);});
   (async function w(){ try{const r=await (await fetch('/jobs/latest')).json(); if(r.job_id){location.replace('/live/'+r.job_id);return;}}catch(e){} setTimeout(w,1500); })();
 }
 const srv   = location.origin;
@@ -427,23 +431,29 @@ async function finishScan(){
   await fetch(`${srv}/jobs/${jobId}/run`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({articulated:art})});
   document.getElementById('guide').textContent='Building the final model and URDF… this page switches to the result when done.';
 }
-async function fetchPreview(){
-  const r=await fetch(`${srv}/jobs/${jobId}/preview?scan=${scanIdx}`,{cache:'no-store'});
-  const buf=await r.arrayBuffer(); if(buf.byteLength<4)return;
+let bgCloud=null;
+async function loadCloud(bg){
+  const r=await fetch(`${srv}/jobs/${jobId}/preview?scan=${scanIdx}&bg=${bg?1:0}`,{cache:'no-store'});
+  const buf=await r.arrayBuffer(); if(buf.byteLength<4)return null;
   const n=new DataView(buf).getUint32(0,true);
   const pos=new Float32Array(buf.slice(4,4+12*n)); const rgb=new Uint8Array(buf,4+12*n,3*n);
-  const col=new Float32Array(3*n); for(let i=0;i<3*n;i++)col[i]=rgb[i]/255;
-  if(cloud){scene.remove(cloud);cloud.geometry.dispose();}
+  const col=new Float32Array(3*n);
+  for(let i=0;i<n;i++){ if(bg){const g=(rgb[3*i]+rgb[3*i+1]+rgb[3*i+2])/765*0.45+0.1; col[3*i]=col[3*i+1]=col[3*i+2]=g;}
+                        else {col[3*i]=rgb[3*i]/255;col[3*i+1]=rgb[3*i+1]/255;col[3*i+2]=rgb[3*i+2]/255;} }
   const g=new THREE.BufferGeometry(); g.setAttribute('position',new THREE.BufferAttribute(pos,3)); g.setAttribute('color',new THREE.BufferAttribute(col,3));
-  cloud=new THREE.Points(g,new THREE.PointsMaterial({size:n>20000?0.006:0.012,vertexColors:true}));
-  scene.add(cloud);
+  return new THREE.Points(g,new THREE.PointsMaterial({size:bg?0.01:(n>20000?0.006:0.012),vertexColors:true}));
+}
+async function fetchPreview(){
+  const c=await loadCloud(false); if(c){ if(cloud){scene.remove(cloud);cloud.geometry.dispose();} cloud=c; scene.add(cloud); }
+  if(bgCloud){scene.remove(bgCloud);bgCloud.geometry.dispose();bgCloud=null;}
+  if(document.getElementById('l-showbg').checked){ bgCloud=await loadCloud(true); if(bgCloud) scene.add(bgCloud); }
 }
 function showState(d){
   if(d.progress===undefined)return;
   document.getElementById('l-pct').textContent=d.progress+'%';
   document.getElementById('l-bar').style.width=d.progress+'%';
   document.getElementById('l-n').textContent=d.n_frames; document.getElementById('l-reg').textContent=d.n_registered;
-  document.getElementById('l-pts').textContent=(d.n_points||0).toLocaleString();
+  document.getElementById('l-pts').textContent=(d.n_points||0).toLocaleString(); document.getElementById('l-fg').textContent=(d.n_points||0).toLocaleString(); document.getElementById('l-bgn').textContent=(d.n_background_removed||0).toLocaleString();
   document.getElementById('l-cov').textContent=Math.round((d.coverage||0)*12)+'/12';
   document.getElementById('l-eng').textContent=d.engine||'-'; document.getElementById('l-q').textContent=d.queue||0;
   document.getElementById('guide').textContent=d.guidance||'';
